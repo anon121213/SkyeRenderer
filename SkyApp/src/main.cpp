@@ -28,6 +28,7 @@ Vertex {
   float pos[3];
   float uv[2];
   float normal[3];
+  float tangent[4];
 };
 
 struct PushConstants
@@ -83,19 +84,35 @@ int main()
     auto texture = device.createTexture({ Sky::RHI::Format::RGBA8_UNORM, TEX, TEX, Sky::RHI::TextureUsage::Sampled });
     device.uploadTextureData(texture, pixels.data(), pixels.size() * sizeof(uint32_t));
 
-    constexpr uint32_t TEXMETALLIC = 256;
-    std::vector<uint32_t> pixelsMetallic(TEXMETALLIC * TEXMETALLIC);
-    for (uint32_t y = 0; y < TEXMETALLIC; ++y)
-      for (uint32_t x = 0; x < TEXMETALLIC; ++x)
+    std::vector<uint32_t> pixelsMetallic(TEX * TEX);
+    for (uint32_t y = 0; y < TEX; ++y)
+      for (uint32_t x = 0; x < TEX; ++x)
       {
         if (x < 128)
-          pixelsMetallic[y * TEXMETALLIC + x] = pack(0, /*rough*/ 25, /*metal*/ 255, 255);
+          pixelsMetallic[y * TEX + x] = pack(0, /*rough*/ 25, /*metal*/ 255, 255);
         else
-          pixelsMetallic[y * TEXMETALLIC + x] = pack(0, /*rough*/ 204, /*metal*/ 0, 255);
+          pixelsMetallic[y * TEX + x] = pack(0, /*rough*/ 204, /*metal*/ 0, 255);
       }
 
-    auto textureMetallic = device.createTexture({ Sky::RHI::Format::RGBA8_UNORM, TEXMETALLIC, TEXMETALLIC, Sky::RHI::TextureUsage::Sampled });
+    auto textureMetallic = device.createTexture({ Sky::RHI::Format::RGBA8_UNORM, TEX, TEX, Sky::RHI::TextureUsage::Sampled });
     device.uploadTextureData(textureMetallic, pixelsMetallic.data(), pixelsMetallic.size() * sizeof(uint32_t));
+
+    std::vector<uint32_t> normalPixels(TEX * TEX);
+    const float freq = 6.0f * 2.0f * 3.14159265f;
+    const float amp  = 0.5f;
+    for (uint32_t y = 0; y < TEX; ++y)
+      for (uint32_t x = 0; x < TEX; ++x) {
+        float u = float(x)/TEX, v = float(y)/TEX;
+        // наклон высотного поля h=amp*sin(freq*u)*sin(freq*v)
+        float dhdu = amp*freq*cosf(freq*u)*sinf(freq*v);
+        float dhdv = amp*freq*sinf(freq*u)*cosf(freq*v);
+        glm::vec3 n = glm::normalize(glm::vec3(-dhdu, -dhdv, 1.0f));   // tangent-space нормаль
+        glm::vec3 enc = n*0.5f + 0.5f;                                 // [-1,1] → [0,1]
+        normalPixels[y*TEX+x] = pack(uint8_t(enc.x*255), uint8_t(enc.y*255), uint8_t(enc.z*255), 255);
+      }
+
+    auto textureNormal = device.createTexture({ Sky::RHI::Format::RGBA8_UNORM, TEX, TEX, Sky::RHI::TextureUsage::Sampled });
+    device.uploadTextureData(textureNormal, normalPixels.data(), normalPixels.size() * sizeof(uint32_t));
 
     auto sampler = device.createSampler({});
 
@@ -103,7 +120,8 @@ int main()
     layoutDesc.bindings = {
       { 0, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment }, // albedo
       { 1, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment }, // metalRough
-      { 2, Sky::RHI::DescriptorType::UniformBuffer,        Sky::RHI::ShaderStage::Fragment }, // scene
+      { 2, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment }, // normalMap
+      { 3, Sky::RHI::DescriptorType::UniformBuffer,        Sky::RHI::ShaderStage::Fragment }, // scene
     };
     auto descLayout = device.createDescriptorSetLayout(layoutDesc);
 
@@ -117,7 +135,8 @@ int main()
     auto descSet = device.createDescriptorSet(descLayout);
     device.updateDescriptorSetTexture(descSet, 0, texture, sampler);
     device.updateDescriptorSetTexture(descSet, 1, textureMetallic, sampler);
-    device.updateDescriptorSetBuffer(descSet, 2, sceneUBO, sizeof(SceneData));
+    device.updateDescriptorSetTexture(descSet, 2, textureNormal, sampler);
+    device.updateDescriptorSetBuffer(descSet, 3, sceneUBO, sizeof(SceneData));
 
     auto vertCode = loadSpirv(std::string(SHADER_DIR) + "/triangle.vert.spv");
     auto fragCode = loadSpirv(std::string(SHADER_DIR) + "/triangle.frag.spv");
@@ -128,9 +147,10 @@ int main()
     const auto sw = device.defaultSwapchain();
 
     const std::vector<Sky::RHI::VertexAttribute> attrs = {
-      { 0, Sky::RHI::Format::RGB32_SFLOAT, offsetof(Vertex, pos) },   // location 0 = pos
-      { 1, Sky::RHI::Format::RG32_SFLOAT,  offsetof(Vertex, uv)  },   // location 1 = uv
-      { 2, Sky::RHI::Format::RGB32_SFLOAT, offsetof(Vertex, normal) } // location 2 = normal
+      { 0, Sky::RHI::Format::RGB32_SFLOAT,  offsetof(Vertex, pos) },     // location 0 = pos
+      { 1, Sky::RHI::Format::RG32_SFLOAT,   offsetof(Vertex, uv)  },     // location 1 = uv
+      { 2, Sky::RHI::Format::RGB32_SFLOAT,  offsetof(Vertex, normal) },  // location 2 = normal
+      { 3, Sky::RHI::Format::RGBA32_SFLOAT, offsetof(Vertex, tangent) }  // location 3 = tangent
     };
 
     Sky::RHI::GraphicsPipelineDesc pipeDesc{};
@@ -145,7 +165,7 @@ int main()
 
     const auto pipeline = device.createGraphicsPipeline(pipeDesc);
 
-    const Vertex verts[24] = {
+    Vertex verts[24] = {
       // front (z=-0.5)
       {{-0.5f,-0.5f,-0.5f},{0,0}, {0, 0, -1}}, {{ 0.5f,-0.5f,-0.5f},{1,0}, {0, 0, -1}}, {{ 0.5f, 0.5f,-0.5f},{1,1}, {0, 0, -1}}, {{-0.5f, 0.5f,-0.5f},{0,1}, {0, 0, -1}},
       // back (z=+0.5)
@@ -159,6 +179,22 @@ int main()
       // bottom (y=-0.5)
       {{-0.5f,-0.5f, 0.5f},{0,0}, {0, -1, 0}}, {{ 0.5f,-0.5f, 0.5f},{1,0}, {0, -1, 0}}, {{ 0.5f,-0.5f,-0.5f},{1,1}, {0, -1, 0}}, {{-0.5f,-0.5f,-0.5f},{0,1}, {0, -1, 0}},
     };
+
+    for (int f = 0; f < 6; ++f) {
+      Vertex& a = verts[f*4+0]; Vertex& b = verts[f*4+1]; Vertex& c = verts[f*4+2];
+      glm::vec3 p0(a.pos[0],a.pos[1],a.pos[2]), p1(b.pos[0],b.pos[1],b.pos[2]), p2(c.pos[0],c.pos[1],c.pos[2]);
+      glm::vec2 uv0(a.uv[0],a.uv[1]), uv1(b.uv[0],b.uv[1]), uv2(c.uv[0],c.uv[1]);
+      glm::vec3 e1 = p1-p0, e2 = p2-p0;
+      glm::vec2 d1 = uv1-uv0, d2 = uv2-uv0;
+      float r = 1.0f / (d1.x*d2.y - d2.x*d1.y);
+      glm::vec3 T  = glm::normalize((e1*d2.y - e2*d1.y) * r);
+      glm::vec3 Bt = (e2*d1.x - e1*d2.x) * r;              // bitangent для определения знака
+      glm::vec3 N(a.normal[0],a.normal[1],a.normal[2]);
+      float w = (glm::dot(glm::cross(N, T), Bt) < 0.0f) ? -1.0f : 1.0f;   // handedness
+      for (int i = 0; i < 4; ++i) {
+        verts[f*4+i].tangent[0]=T.x; verts[f*4+i].tangent[1]=T.y; verts[f*4+i].tangent[2]=T.z; verts[f*4+i].tangent[3]=w;
+      }
+    }
 
     const uint16_t indices[36] = {
       0, 1, 2,  2, 3, 0,     // front

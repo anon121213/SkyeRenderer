@@ -2,8 +2,9 @@
 
 layout(set = 0, binding = 0) uniform sampler2D albedo;
 layout(set = 0, binding = 1) uniform sampler2D metalRough;
+layout(set = 0, binding = 2) uniform sampler2D normalMap;
 
-layout(set = 0, binding = 2) uniform sceneData {
+layout(set = 0, binding = 3) uniform sceneData {
     vec3 lightDir;
     vec3 lightColor;
     vec3 camPos;
@@ -12,6 +13,8 @@ layout(set = 0, binding = 2) uniform sceneData {
 layout(location = 0) in vec2 fragUv;
 layout(location = 1) in vec3 fragNormal;
 layout(location = 2) in vec3 fragWorldPos;
+layout(location = 3) in vec3 fragTangent;
+layout(location = 4) in float fragHandedness;
 
 layout(location = 0) out vec4 outColor;
 
@@ -48,6 +51,12 @@ void main() {
     float metallic = mr.y;
 
     vec3 N = normalize(fragNormal);
+    vec3 T = normalize(fragTangent);
+    T = normalize(T - N * dot(N, T));
+    vec3 B = cross(N, T) * fragHandedness;
+    mat3 TBN = mat3(T, B, N);
+    vec3 nTan = texture(normalMap, fragUv).rgb * 2.0 - 1.0;
+    N = normalize(TBN * nTan);
     vec3 V = normalize(scene.camPos - fragWorldPos);
     vec3 L = normalize(scene.lightDir);
     vec3 H = normalize(V + L);
