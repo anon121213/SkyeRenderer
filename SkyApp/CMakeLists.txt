@@ -19,13 +19,26 @@ set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
 
+FetchContent_Declare(
+        tinygltf
+        GIT_REPOSITORY https://github.com/syoyo/tinygltf.git
+        GIT_TAG        v2.9.3
+        GIT_SHALLOW    TRUE
+)
+set(TINYGLTF_HEADER_ONLY          ON  CACHE INTERNAL "" FORCE)
+set(TINYGLTF_INSTALL              OFF CACHE INTERNAL "" FORCE)
+set(TINYGLTF_BUILD_LOADER_EXAMPLE OFF CACHE INTERNAL "" FORCE)
+
 FetchContent_MakeAvailable(glfw)
 FetchContent_MakeAvailable(glm)
+FetchContent_MakeAvailable(tinygltf)
 
 add_executable(SkyApp
         src/main.cpp
         src/Window.cpp
         src/Window.h
+        src/GltfModel.cpp
+        src/GltfModel.h
 )
 
 # ---------- Компиляция шейдеров ----------
@@ -60,5 +73,8 @@ add_dependencies(SkyApp CompileShaders)
 target_compile_definitions(SkyApp PRIVATE SHADER_DIR="${SHADER_BIN_DIR}")
 # ---------- Конец компиляции шейдеров ----------
 
-target_link_libraries(SkyApp PRIVATE SkyRenderer glfw)
+target_link_libraries(SkyApp PRIVATE SkyRenderer glfw glm::glm)
 target_compile_definitions(SkyApp PRIVATE GLFW_INCLUDE_VULKAN)
+
+target_include_directories(SkyApp PRIVATE ${tinygltf_SOURCE_DIR})
+target_compile_definitions(SkyApp PRIVATE ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets")

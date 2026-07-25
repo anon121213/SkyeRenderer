@@ -9,6 +9,10 @@ find_package(Vulkan REQUIRED)
 
 include(FetchContent)
 
+# Once a dependency is cloned, don't re-run its git "update" step on reconfigure.
+# Avoids a shallow-clone HEAD-hash failure some CMake versions hit on rebuild.
+set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL "" FORCE)
+
 FetchContent_Declare(
         vma
         GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
