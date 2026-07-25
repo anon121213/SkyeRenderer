@@ -2,8 +2,13 @@
 
 #include "SkyRHI/Device.h"
 #include "SkyRHI/FrameGraph.h"
+#include "SkyRHI/ImGuiSupport.h"
 #include "Window.h"
 #include "GltfModel.h"
+
+#include <imgui.h>
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_vulkan.h>
 
 #include <fstream>
 
@@ -37,6 +42,43 @@ struct SceneData {
   glm::vec3 pointColor; float _pad3;
   glm::vec3 camPos;     float _pad4;
 };
+
+static void InitImGui(const Window& window, Sky::RHI::Device& device, VkDescriptorPool* imguiPool, ImGui_ImplVulkan_InitInfo* imguiInit)
+{
+  // --- ImGui init (Vulkan backend via dynamic rendering; GLFW input backend) ---
+  IMGUI_CHECKVERSION();
+  ImGui::CreateContext();
+  ImGui::StyleColorsDark();
+  ImGui_ImplGlfw_InitForVulkan(window.handle(), true);
+
+  const auto imguiInfo = Sky::RHI::imguiVulkanInitInfo(device);
+  static VkFormat imguiColorFormat = imguiInfo.colorFormat;   // must outlive Init (pointer below)
+
+  // ImGui 1.91.5 needs a descriptor pool provided (auto-pool came in a later version)
+  VkDescriptorPoolSize imguiPoolSizes[] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16 } };
+  VkDescriptorPoolCreateInfo imguiPoolInfo{};
+  imguiPoolInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  imguiPoolInfo.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+  imguiPoolInfo.maxSets       = 16;
+  imguiPoolInfo.poolSizeCount = 1;
+  imguiPoolInfo.pPoolSizes    = imguiPoolSizes;
+  vkCreateDescriptorPool(imguiInfo.device, &imguiPoolInfo, nullptr, imguiPool);
+
+  imguiInit->Instance         = imguiInfo.instance;
+  imguiInit->PhysicalDevice   = imguiInfo.physicalDevice;
+  imguiInit->Device           = imguiInfo.device;
+  imguiInit->QueueFamily      = imguiInfo.queueFamily;
+  imguiInit->Queue            = imguiInfo.queue;
+  imguiInit->MinImageCount    = imguiInfo.minImageCount;
+  imguiInit->ImageCount       = imguiInfo.imageCount;
+  imguiInit->MSAASamples      = VK_SAMPLE_COUNT_1_BIT;
+  imguiInit->DescriptorPool   = *imguiPool;
+  imguiInit->UseDynamicRendering = true;
+  imguiInit->PipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+  imguiInit->PipelineRenderingCreateInfo.colorAttachmentCount    = 1;
+  imguiInit->PipelineRenderingCreateInfo.pColorAttachmentFormats = &imguiColorFormat;
+  ImGui_ImplVulkan_Init(imguiInit);
+}
 
 int main()
 {
@@ -127,6 +169,16 @@ int main()
 
     const auto pipeline = device.createGraphicsPipeline(pipeDesc);
 
+    // --- ImGui init (Vulkan backend via dynamic rendering; GLFW input backend) ---
+    VkDescriptorPool imguiPool = VK_NULL_HANDLE;
+    ImGui_ImplVulkan_InitInfo imguiInfo{};
+
+    InitImGui(window, device, &imguiPool, &imguiInfo);
+
+    // debug-tweakable scene params (demonstrates ImGui + useful for Phase 7 tuning)
+    float sunIntensity   = 2.0f;
+    float pointIntensity = 8.0f;
+
     const auto vb = device.createBuffer({
        model.vertices.size() * sizeof(Vertex),
        Sky::RHI::BufferUsage::Vertex | Sky::RHI::BufferUsage::TransferDst,
@@ -153,6 +205,15 @@ int main()
 
       device.beginFrame();
 
+      ImGui_ImplVulkan_NewFrame();
+      ImGui_ImplGlfw_NewFrame();
+      ImGui::NewFrame();
+      ImGui::Begin("SkyRenderer");
+      ImGui::Text("%.1f FPS (%.2f ms)", ImGui::GetIO().Framerate, 1000.0f / ImGui::GetIO().Framerate);
+      ImGui::SliderFloat("Sun intensity",   &sunIntensity,   0.0f, 10.0f);
+      ImGui::SliderFloat("Point intensity", &pointIntensity, 0.0f, 20.0f);
+      ImGui::End();
+
       const auto extent = device.swapchainExtent(sw);
 
       const float time   = static_cast<float>(glfwGetTime());
@@ -177,9 +238,9 @@ int main()
 
       SceneData scene{};
       scene.sunDir     = glm::normalize(glm::vec3(0.5f, 1.0f, 0.3f));
-      scene.sunColor   = glm::vec3(2.0f);
+      scene.sunColor   = glm::vec3(sunIntensity);
       scene.pointPos   = glm::vec3(cos(time)*3.0f, 1.5f, sin(time)*3.0f);
-      scene.pointColor = glm::vec3(8.0f);
+      scene.pointColor = glm::vec3(pointIntensity);
       scene.camPos     = glm::vec3(0.0f, 0.0f, 3.0f);
       memcpy(sceneMapped, &scene, sizeof(SceneData));
 
@@ -203,10 +264,21 @@ int main()
 
       fg.compile();
       device.execute(fg);
+
+      ImGui::Render();
+      device.recordOverlay([](void* cmd) {
+        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), static_cast<VkCommandBuffer>(cmd));
+      });
+
       device.endFrame();
     }
 
     device.waitIdle();
+
+    ImGui_ImplVulkan_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    vkDestroyDescriptorPool(imguiInfo.Device, imguiPool, nullptr);
 
     device.unmapBuffer(sceneUBO);
     device.destroyBuffer(sceneUBO);

@@ -108,6 +108,7 @@ struct Device::Impl
   void beginFrame();
   void endFrame();
   void waitIdle() const;
+  void recordOverlay(const std::function<void(void*)>& record);   // ImGui/debug overlay into backbuffer
 
   void immediateSubmit(const std::function<void(VkCommandBuffer)>& record);
   void flushTransfers();

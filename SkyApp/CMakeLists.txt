@@ -29,9 +29,30 @@ set(TINYGLTF_HEADER_ONLY          ON  CACHE INTERNAL "" FORCE)
 set(TINYGLTF_INSTALL              OFF CACHE INTERNAL "" FORCE)
 set(TINYGLTF_BUILD_LOADER_EXAMPLE OFF CACHE INTERNAL "" FORCE)
 
+FetchContent_Declare(
+        imgui
+        GIT_REPOSITORY https://github.com/ocornut/imgui.git
+        GIT_TAG        v1.91.5
+        GIT_SHALLOW    TRUE
+)
+
 FetchContent_MakeAvailable(glfw)
 FetchContent_MakeAvailable(glm)
 FetchContent_MakeAvailable(tinygltf)
+FetchContent_MakeAvailable(imgui)   # no CMakeLists — just populates ${imgui_SOURCE_DIR}
+
+# ImGui as a static lib: core + GLFW backend + Vulkan backend (via volk, since we use VK_NO_PROTOTYPES)
+add_library(imgui STATIC
+        ${imgui_SOURCE_DIR}/imgui.cpp
+        ${imgui_SOURCE_DIR}/imgui_draw.cpp
+        ${imgui_SOURCE_DIR}/imgui_tables.cpp
+        ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
+)
+target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+target_compile_definitions(imgui PUBLIC IMGUI_IMPL_VULKAN_USE_VOLK)
+target_link_libraries(imgui PUBLIC glfw volk)
 
 add_executable(SkyApp
         src/main.cpp
@@ -73,7 +94,7 @@ add_dependencies(SkyApp CompileShaders)
 target_compile_definitions(SkyApp PRIVATE SHADER_DIR="${SHADER_BIN_DIR}")
 # ---------- Конец компиляции шейдеров ----------
 
-target_link_libraries(SkyApp PRIVATE SkyRenderer glfw glm::glm)
+target_link_libraries(SkyApp PRIVATE SkyRenderer glfw glm::glm imgui)
 target_compile_definitions(SkyApp PRIVATE GLFW_INCLUDE_VULKAN)
 
 target_include_directories(SkyApp PRIVATE ${tinygltf_SOURCE_DIR})

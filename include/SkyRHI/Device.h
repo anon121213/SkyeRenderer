@@ -19,6 +19,7 @@ namespace Sky::RHI
 {
 
 class FrameGraph;   // forward decl — execute() takes it by reference; full def in DeviceImpl.cpp
+struct ImGuiVulkanInitInfo;   // debug interop (SkyRHI/ImGuiSupport.h) — friended below
 
 struct DeviceCreateInfo
 {
@@ -44,6 +45,12 @@ public:
   void beginFrame();
   void endFrame();
   void execute(FrameGraph& fg);
+
+  // Records a debug overlay into the current frame's command buffer, on top of the
+  // scene (backbuffer): PRESENT->COLOR, dynamic rendering (load), callback, ->PRESENT.
+  // The callback receives the raw VkCommandBuffer as void* (app casts it for ImGui).
+  // Call between execute() and endFrame().
+  void recordOverlay(const std::function<void(void*)>& record);
   [[nodiscard]] Format swapchainFormat(SwapchainHandle handle) const;
 
   void waitIdle() const;
@@ -86,6 +93,8 @@ public:
   struct Impl;
 
 private:
+  friend ImGuiVulkanInitInfo imguiVulkanInitInfo(Device&);   // debug interop needs raw handles from m_Impl
+
   std::unique_ptr<Impl> m_Impl;
 };
 

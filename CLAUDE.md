@@ -144,8 +144,22 @@ Sky::RHI::BufferHandle vb = device.createBuffer({...});   // POD, uint64_t
 - **НЕ реализовано (TODO для dedicated-железа, напр. RTX):** queue ownership transfer transfer→graphics + отдельный transfer command-pool. На MoltenVK не нужно (одно семейство → cmd из graphics-pool submit'ится в тот же family).
 - Streaming manager (политика: что/когда/evict) — **движковое, не RHI** (осознанно отложено). RHI даёт механизм, политику строит consumer.
 
-**Phase 6 (Frame Graph — Advanced) — NEXT 🚧**
-Задачи: transient resource aliasing (memory reuse между passes), pass culling (dead-code elimination), async compute scheduling, multi-thread pass recording, DAG debug view (ImGui).
+**ПОРЯДОК ИЗМЕНЁН: 7 идёт РАНЬШЕ 6.** Причина: Phase 6 (FG advanced: aliasing/async-compute/MT) оптимизирует много-пассовый пайплайн, которого пока нет (1 pass). Phase 7 создаёт пассы (shadow, IBL-compute, skybox) → потом Phase 6 их оптимизирует. Сначала workload, потом оптимизатор.
+
+**ImGui интеграция — DONE ✅ (2026-07-26)** — фундамент debug-UI (твики Phase 7, frame debugger позже).
+- ImGui 1.91.5 через FetchContent (нет CMakeLists → static lib target `imgui` из core + imgui_impl_glfw + imgui_impl_vulkan). `IMGUI_IMPL_VULKAN_USE_VOLK` (мы на volk).
+- Целиком в SkyApp (app имеет GLFW + volk через skypch). RHI-ядро от ImGui НЕ зависит.
+- RHI даёт: (1) `include/SkyRHI/ImGuiSupport.h` — `imguiVulkanInitInfo(Device&)` (raw хендлы, friend Device, сегрегированный debug-хедер), (2) `Device::recordOverlay(callback)` — backbuffer PRESENT→COLOR→dynamic rendering(LOAD)→callback(VkCommandBuffer как void*)→PRESENT.
+- App: ImGui_ImplVulkan_Init с `UseDynamicRendering=true` + `PipelineRenderingCreateInfo`. **ImGui 1.91.5 требует свой descriptor pool** (auto-pool `DescriptorPoolSize` появился позже) — создаём в app. Per-frame: NewFrame → UI → после execute: `ImGui::Render()` + `recordOverlay(ImGui_ImplVulkan_RenderDrawData)`. Демо: FPS + слайдеры Sun/Point intensity.
+- Мелочь: дубликат-линк glfw warning (линкуется напрямую + через imgui PUBLIC) — безобиден.
+
+**Phase 7 (Shadows + IBL) — NEXT после ImGui** 🚧
+skybox (equirect HDR) → IBL (irradiance/prefiltered/BRDF LUT, металл отражает окружение) → shadows (shadow map + PCF). Первые compute-пассы здесь.
+
+**Phase 6 (Frame Graph — Advanced) — после 7**
+transient aliasing, pass culling, **async compute** (много очередей), multi-thread recording. + рефактор FG execute (color/depth special-case → табличный realize()).
+
+**Frame Debugger — после Phase 6** (идея пользователя, отличная). Т.к. FG знает пассы по именам → auto-обёртка каждого в GPU timestamp queries (VkQueryPool) + **timeline-визуализация** (Gantt: пасс = полоска, позиция = старт на GPU, ширина = длительность; много дорожек с async compute). Окупается до RTX (Phase 10-11). Не «циферки», а полноценный GPU timeline profiler (уровень UE GPU Visualizer / RenderDoc timeline).
 
 **Отложено осознанно (не хаки):**
 - **Skybox → перенесён в Phase 7** — неотделим от IBL; HDR equirect грузится один раз для неба + IBL (irradiance/prefiltered). Отдельный skybox без IBL = чистая косметика.

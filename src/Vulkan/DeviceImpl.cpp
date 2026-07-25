@@ -3,6 +3,7 @@
 #include "DeviceImpl.h"
 
 #include "SkyRHI/FrameGraph.h"
+#include "SkyRHI/ImGuiSupport.h"
 #include "VulkanDescriptorSet.h"
 #include "VulkanTranslate.h"
 
@@ -230,6 +231,42 @@ void Device::Impl::endFrame()
   vkQueuePresentKHR(device.graphicQueue(), &presentInfo);
 }
 
+void Device::Impl::recordOverlay(const std::function<void(void*)>& record)
+{
+  const VkImage     image  = defaultEntry->swapchain.images()[currentImageIndex];
+  const VkImageView view   = defaultEntry->swapchain.imageViews()[currentImageIndex];
+  const VkExtent2D  extent = defaultEntry->swapchain.extent();
+
+  // FG left the backbuffer in PRESENT_SRC — bring it back to COLOR_ATTACHMENT to draw on top
+  transitionImageLayout(commandBuffer, image,
+    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+  VkRenderingAttachmentInfo color{};
+  color.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+  color.imageView   = view;
+  color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  color.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;     // keep the rendered scene underneath
+  color.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+
+  VkRenderingInfo ri{};
+  ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
+  ri.renderArea           = { {0, 0}, extent };
+  ri.layerCount           = 1;
+  ri.colorAttachmentCount = 1;
+  ri.pColorAttachments    = &color;
+
+  vkCmdBeginRenderingKHR(commandBuffer, &ri);
+  record(static_cast<void*>(commandBuffer));   // app: ImGui_ImplVulkan_RenderDrawData(drawData, cmd)
+  vkCmdEndRenderingKHR(commandBuffer);
+
+  transitionImageLayout(commandBuffer, image,
+    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0,
+    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+}
+
 void Device::Impl::immediateSubmit(const std::function<void(VkCommandBuffer)>& record)
 {
   VkCommandBuffer cmd = commandPool.allocatePrimary();
@@ -295,6 +332,27 @@ void Device::execute(FrameGraph& fg)
 {
   CommandList cmd = m_Impl->createCommandList(m_Impl->commandBuffer);
   fg.execute(cmd);
+}
+
+void Device::recordOverlay(const std::function<void(void*)>& record)
+{
+  m_Impl->recordOverlay(record);
+}
+
+ImGuiVulkanInitInfo imguiVulkanInitInfo(Device& device)
+{
+  Device::Impl* impl = device.m_Impl.get();
+
+  ImGuiVulkanInitInfo info{};
+  info.instance       = impl->instance.handle();
+  info.physicalDevice = impl->device.physicalDevice();
+  info.device         = impl->device.handle();
+  info.queueFamily    = impl->device.graphicFamilyIndex();
+  info.queue          = impl->device.graphicQueue();
+  info.colorFormat    = impl->defaultEntry->swapchain.imageFormat();
+  info.imageCount     = static_cast<uint32_t>(impl->defaultEntry->swapchain.images().size());
+  info.minImageCount  = info.imageCount;
+  return info;
 }
 
 Format Device::swapchainFormat(SwapchainHandle handle) const
