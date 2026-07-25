@@ -69,6 +69,7 @@ public:
   [[nodiscard]] TextureHandle createTexture(const TextureDesc& desc);
   void destroyTexture(TextureHandle handle) noexcept;
   void uploadTextureData(TextureHandle handle, const void* data, size_t size);
+  [[nodiscard]] uint64_t uploadTextureDataAsync(TextureHandle handle, const void* data, size_t size);
 
   [[nodiscard]] SamplerHandle createSampler(const SamplerDesc& desc);
   void destroySampler(SamplerHandle handle) noexcept;
@@ -80,6 +81,7 @@ public:
   void destroyDescriptorSet(DescriptorSetHandle handle);
   void updateDescriptorSetTexture(DescriptorSetHandle setHandler, uint32_t binding, TextureHandle textureHandle, SamplerHandle samplerHandle);
   void updateDescriptorSetBuffer(DescriptorSetHandle setHandler, uint32_t binding, BufferHandle bufferHandle, uint64_t range, uint64_t offset = 0);
+  void flushTransfers();
 
   struct Impl;
 

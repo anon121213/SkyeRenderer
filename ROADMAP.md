@@ -267,16 +267,16 @@ SkyRenderer/                                ← standalone framework, git submod
 **Цель:** Текстурированный куб. Начало Material system.
 
 **Задачи:**
-- [ ] `SkyRHI::Texture` — все типы (2D, 3D, Array, Cubemap)
-- [ ] `SkyRHI::Sampler` — filter modes, wrap modes, anisotropy
-- [ ] `Device::uploadTextureData` через staging
-- [ ] Descriptor set management (`DescriptorSetLayout`, `DescriptorSet`)
-- [ ] `Bindless preparation` — descriptor arrays готовы в API, но не активны
-- [ ] `Texture loading` через stb_image (в SkyApp, не в library)
-- [ ] Текстурированный куб
-- [ ] `SkyGraphics::Material` — pipeline + texture bindings
+- [x] `SkyRHI::Texture` (2D; 3D/Array/Cubemap — по мере надобности, Cubemap в Phase 7)
+- [x] `SkyRHI::Sampler` — filter/wrap modes
+- [x] `Device::uploadTextureData` через staging
+- [x] Descriptor set management (`DescriptorSetLayout`, `DescriptorSet`, `updateDescriptorSet{Texture,Buffer}`)
+- [~] `Bindless preparation` — отложено до Phase 9
+- [x] `Texture loading` — через tinygltf (stb внутри него), в SkyApp
+- [x] Текстурированный куб
+- [~] `SkyGraphics::Material` — отложено (rule of three; Graphics-слой/движок)
 
-**Результат:** PBR текстуры видны, materials system работает.
+**Результат:** ✅ Текстуры + descriptor sets работают. **DONE 2026-07-25.**
 
 ---
 
@@ -287,16 +287,17 @@ SkyRenderer/                                ← standalone framework, git submod
 **Цель:** Физически корректное освещение — Cook-Torrance, GGX, Fresnel.
 
 **Задачи:**
-- [ ] Vertex format с normal + tangent + UV
-- [ ] Normal mapping (tangent space)
-- [ ] Metallic-Roughness workflow
-- [ ] GGX specular BRDF
-- [ ] Fresnel-Schlick approximation
-- [ ] Direct lighting (directional + point light в UBO)
-- [ ] Простой skybox (cubemap sampling)
-- [ ] Демо-сцена: несколько материалов, разные roughness/metallic
+- [x] Vertex format с normal + tangent + UV
+- [x] Normal mapping (tangent space) — тангенты вычисляются (Lengyel) если нет в файле
+- [x] Metallic-Roughness workflow
+- [x] GGX specular BRDF
+- [x] Fresnel-Schlick approximation
+- [x] Direct lighting (directional + point light в UBO)
+- [x] glTF model loading (tinygltf) — реальная PBR-модель (DamagedHelmet)
+- [→] ~~Простой skybox~~ — перенесён в Phase 7 (неотделим от IBL, HDR-карта одна на оба)
+- [~] Демо-сцена мульти-материал — отложено (descriptor-per-material / bindless Phase 9)
 
-**Результат:** Реалистичный shading на кубе / модели.
+**Результат:** ✅ Реалистичный PBR shading на реальной glTF-модели. **DONE 2026-07-25.**
 
 ---
 
@@ -307,13 +308,15 @@ SkyRenderer/                                ← standalone framework, git submod
 **Цель:** Загрузка ресурсов в фоне без freeze основного рендера.
 
 **Задачи:**
-- [ ] Async transfer queue support в `Device`
-- [ ] Timeline semaphores для sync между transfer и graphics
-- [ ] `Device::uploadTextureDataAsync` — не блокирует main thread
-- [ ] Streaming manager — очередь ассетов, priority-based
-- [ ] Демо: подгрузка новых текстур пока пользователь ходит
+- [x] Async transfer queue support в `Device` (dedicated DMA / fallback на graphics)
+- [x] Timeline semaphores для sync между transfer и graphics
+- [x] `Device::uploadTextureDataAsync` — не блокирует main thread (async submit + timeline signal)
+- [x] Non-blocking cleanup — `collectFinishedTransfers` (poll timeline) на beginFrame
+- [~] Streaming manager (priority queue, eviction) — **движковое, не RHI** (осознанно отложено)
+- [~] Демо рантайм-подгрузки — пропущено (бесполезно «ради увидеть»; механизм проверен)
+- [→] TODO для dedicated-железа: queue ownership transfer + отдельный transfer command-pool
 
-**Результат:** Плавный стриминг без hitches.
+**Результат:** ✅ RHI-механизм async-transfer (queue + timeline + non-blocking cleanup). Политику стриминга строит движок поверх. **DONE 2026-07-26.**
 
 ---
 

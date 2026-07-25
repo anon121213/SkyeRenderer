@@ -121,25 +121,46 @@ Sky::RHI::BufferHandle vb = device.createBuffer({...});   // POD, uint64_t
 - **Path B — все хаки Phase 1 удалены.** Consumer-driven: beginFrame/endFrame/execute(FrameGraph&). Consumer создаёт shaders/pipeline/VB/IB и сам декларирует passes. Device ctor чистый. swapchainFormat/swapchainExtent геттеры.
 - **Крутящийся 3D куб** (8 верш + 36 индексов, depth перекрытие граней), validation чистая
 
-**Известный смелл (рефактор в Phase 3):** FG execute special-cases по типу attachment (Color/Depth блоки). В Phase 3 (3-й тип = texture) обобщим: единый realize()+кеш, табличные barriers, тонкая attachment assembly. Рефактор внутренностей, не архитектуры.
+**Phase 3 (Textures & Descriptors) — DONE ✅ (2026-07-25)**
+- `SkyRHI::Texture` (VulkanImage — 2D), `Sampler` (VulkanSampler RAII)
+- `uploadTextureData` через staging (image copy + layout transitions via immediateSubmit)
+- **Descriptor sets** — DescriptorSetLayout, DescriptorPool (100 each: sampler/UBO/storage), DescriptorSet; updateDescriptorSetTexture. VulkanDescriptorSet dtor пустой (pool frees all).
+- Текстурированный куб (procedural checkerboard) — работал, потом заменён реальной моделью в Phase 4
 
-**Phase 3 (Textures & Materials) — NEXT 🚧**
-Задачи:
-1. `SkyRHI::Texture` (VulkanImage переиспользуется — 2D/3D/Array/Cubemap), `Sampler`
-2. `uploadTextureData` через staging (image copy)
-3. **Descriptor sets** (`DescriptorSetLayout`, `DescriptorSet`) — как шейдеры видят текстуры/UBO. Фундамент под PBR.
-4. Bindless preparation (descriptor arrays в API, не активны)
-5. stb_image loading (в SkyApp)
-6. Текстурированный куб
-7. `SkyGraphics::Material` — первый Sky::Graphics класс
+**Phase 4 (PBR Shading) — DONE ✅ (2026-07-25)**
+- Vertex format: pos + uv + normal + tangent (vec4, w=handedness)
+- **Cook-Torrance BRDF** — GGX (D) / Smith-Schlick (G) / Fresnel-Schlick (F), вынесено в `shade()` функцию
+- **Metallic-Roughness workflow** (glTF-конвенция: G=roughness, B=metallic)
+- **Normal mapping** — tangent space, TBN, Gram-Schmidt re-ortho, handedness; тангенты вычисляются (Lengyel) если нет в файле
+- **Direct lighting** — directional (sun) + point (attenuation 1/d²), через per-frame scene UBO (std140 + `updateDescriptorSetBuffer`)
+- **glTF загрузка** — tinygltf в `SkyApp/src/GltfModel.{h,cpp}`, DamagedHelmet.glb, node-transform baking, image decode. Загрузчик = consumer-scaffolding (в движке будет своя asset-система, не RHI).
+- Реальная PBR-модель (14556 verts) рендерится, validation чистая
 
-**Не сделано в Phase 2 (опц. polish):** `SkyGraphics::Camera` — view/proj inline в main.cpp через glm.
+**Phase 5 (Async Transfer) — DONE ✅ (2026-07-26)**
+- Transfer queue в VulkanDevice — dedicated DMA если есть, иначе fallback на graphics (на MoltenVK — fallback, одно семейство). `transferQueue()`/`transferFamilyIndex()`/`hasDedicatedTransfer()`
+- Timeline semaphore (Vulkan 1.2 core, включена фича): `transferTimeline` + `transferValue`
+- `uploadTextureDataAsync` — async submit на transfer-очередь с timeline-сигналом (без waitIdle), staging в `pendingUploads` (unique_ptr, отложенная чистка)
+- `collectFinishedTransfers` (on beginFrame) — **non-blocking poll** `vkGetSemaphoreCounterValue`, чистит завершённые. `flushTransfers` (blocking) — для старта.
+- **НЕ реализовано (TODO для dedicated-железа, напр. RTX):** queue ownership transfer transfer→graphics + отдельный transfer command-pool. На MoltenVK не нужно (одно семейство → cmd из graphics-pool submit'ится в тот же family).
+- Streaming manager (политика: что/когда/evict) — **движковое, не RHI** (осознанно отложено). RHI даёт механизм, политику строит consumer.
 
-**Куб должен продолжать работать после каждой фазы.**
+**Phase 6 (Frame Graph — Advanced) — NEXT 🚧**
+Задачи: transient resource aliasing (memory reuse между passes), pass culling (dead-code elimination), async compute scheduling, multi-thread pass recording, DAG debug view (ImGui).
 
-**Оставшиеся stub'ы (не хаки — отложенная функциональность):**
-- FGResources::getTexture — stub; realization только imported swapchain (transient VkImage — depth в Phase 2, textures в Phase 3)
-- FG execute обрабатывает только writes (reads/getTexture — Phase 3 с descriptors)
+**Отложено осознанно (не хаки):**
+- **Skybox → перенесён в Phase 7** — неотделим от IBL; HDR equirect грузится один раз для неба + IBL (irradiance/prefiltered). Отдельный skybox без IBL = чистая косметика.
+- **Мульти-меш / мульти-материал модели** — loader берёт первый примитив; полноценно = descriptor-set-на-материал + draw-loop, либо bindless (Phase 9). Не блокер.
+- **SkyGraphics::Mesh/Material/Camera** — RAII high-level слой; строим когда модель устаканится (rule of three).
+- FG execute всё ещё special-case'ит Color/Depth attachment — обобщить при случае.
+- FGResources::getTexture — stub; FG обрабатывает только writes (reads — когда понадобятся).
+
+**Модель/куб должны продолжать работать после каждой фазы.**
+
+**CMake/build нюансы (2026-07-25):**
+- Deps через FetchContent; `FETCHCONTENT_UPDATES_DISCONNECTED ON` в root (иначе shallow-clone git-update ломается на reconfigure).
+- SkyApp линкует `glm::glm` **явно** (транзитивно было хрупко).
+- tinygltf header-only через `${tinygltf_SOURCE_DIR}` include; impl-defines в GltfModel.cpp.
+- **НЕ смешивать** homebrew-cmake с CLion-ninja на одном build-dir → конфликт генераторов. CLion сам держит `cmake-build-debug` (Ninja).
 
 ## Ключевые файлы
 

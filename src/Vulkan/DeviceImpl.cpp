@@ -79,6 +79,18 @@ Device::Impl::Impl(const DeviceCreateInfo& info)
     SKY_RHI_VK_CHECK(vkCreateSemaphore(device.handle(), &semInfo, nullptr, &sem),
                  "Failed to create renderFinished semaphore");
 
+  VkSemaphoreTypeCreateInfo typeInfo{};
+  typeInfo.sType         = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+  typeInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+  typeInfo.initialValue  = 0;
+
+  VkSemaphoreCreateInfo timeLineSemInfo{};
+  timeLineSemInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+  timeLineSemInfo.pNext = &typeInfo;
+
+  SKY_RHI_VK_CHECK(vkCreateSemaphore(device.handle(), &timeLineSemInfo, nullptr, &transferTimeline),
+             "Failed to create timeline semaphore");
+
   VkFenceCreateInfo fenceInfo{};
   fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
   fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
@@ -101,10 +113,74 @@ Device::Impl::~Impl()
     vkDestroySemaphore(device.handle(), sem, nullptr);
 
   vkDestroySemaphore(device.handle(), imageAvailable, nullptr);
+  vkDestroySemaphore(device.handle(), transferTimeline, nullptr);
+}
+
+uint64_t Device::Impl::uploadTextureDataAsync(TextureHandle handle, const void* data, size_t size)
+{
+  VulkanImage* tex = texturePool.resolve(handle);
+  if (!tex)
+  {
+    SKY_RHI_WARN("uploadTextureData: invalid texture handle");
+    return 0;
+  }
+
+  auto staging = std::make_unique<VulkanBuffer>(device.allocator(),
+     BufferDesc{ size, BufferUsage::TransferSrc, MemoryType::CpuOnly });
+  vmaCopyMemoryToAllocation(device.allocator(), data, staging->allocation(), 0, size);
+
+  VkCommandBuffer cmd = commandPool.allocatePrimary();
+
+  VkCommandBufferBeginInfo begin{};
+  begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vkBeginCommandBuffer(cmd, &begin);
+
+  transitionImageLayout(cmd, tex->handle(),
+    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    0, VK_ACCESS_TRANSFER_WRITE_BIT,
+    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+  VkBufferImageCopy region{};
+  region.bufferOffset = 0;
+  region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+  region.imageExtent = { tex->width(), tex->height(), 1 };
+  vkCmdCopyBufferToImage(cmd, staging->handle(), tex->handle(),
+    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+  transitionImageLayout(cmd, tex->handle(),
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+  vkEndCommandBuffer(cmd);
+
+  const uint64_t target = ++transferValue;
+
+  VkTimelineSemaphoreSubmitInfo timelineInfo{};
+  timelineInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+  timelineInfo.signalSemaphoreValueCount = 1;
+  timelineInfo.pSignalSemaphoreValues = &target;
+
+  VkSubmitInfo submit{};
+  submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submit.pNext = &timelineInfo;
+  submit.commandBufferCount = 1;
+  submit.pCommandBuffers = &cmd;
+  submit.signalSemaphoreCount = 1;
+  submit.pSignalSemaphores = &transferTimeline;
+
+  SKY_RHI_VK_CHECK(vkQueueSubmit(device.transferQueue(), 1, &submit, VK_NULL_HANDLE),
+                   "Async upload submit failed");
+
+  pendingUploads.push_back({ std::move(staging), cmd, target });
+  return target;
 }
 
 void Device::Impl::beginFrame()
 {
+  collectFinishedTransfers();
+
   vkWaitForFences(device.handle(), 1, &inFlight, VK_TRUE, UINT64_MAX);
   vkResetFences(device.handle(), 1, &inFlight);
 
@@ -154,7 +230,6 @@ void Device::Impl::endFrame()
   vkQueuePresentKHR(device.graphicQueue(), &presentInfo);
 }
 
-
 void Device::Impl::immediateSubmit(const std::function<void(VkCommandBuffer)>& record)
 {
   VkCommandBuffer cmd = commandPool.allocatePrimary();
@@ -180,6 +255,21 @@ void Device::Impl::immediateSubmit(const std::function<void(VkCommandBuffer)>& r
   vkQueueWaitIdle(device.graphicQueue());
 
   commandPool.free(cmd);
+}
+
+void Device::Impl::flushTransfers()
+{
+  if (transferValue == 0) return;
+
+  VkSemaphoreWaitInfo wait{};
+  wait.sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+  wait.semaphoreCount = 1;
+  wait.pSemaphores    = &transferTimeline;
+  wait.pValues        = &transferValue;
+  vkWaitSemaphores(device.handle(), &wait, UINT64_MAX);
+
+  for (auto& u : pendingUploads) commandPool.free(u.cmd);
+  pendingUploads.clear();
 }
 
 void Device::Impl::waitIdle() const
@@ -368,6 +458,10 @@ void Device::uploadTextureData(TextureHandle handle, const void* data, size_t si
       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
   });
 }
+uint64_t Device::uploadTextureDataAsync(TextureHandle handle, const void* data, size_t size)
+{
+  return m_Impl->uploadTextureDataAsync(handle, data, size);
+}
 
 SamplerHandle Device::createSampler(const SamplerDesc& desc)
 {
@@ -464,6 +558,10 @@ void Device::updateDescriptorSetBuffer(DescriptorSetHandle setHandler, uint32_t 
   write.pBufferInfo = &bufferInfo;
 
   vkUpdateDescriptorSets(m_Impl->device.handle(), 1, &write, 0, nullptr);
+}
+void Device::flushTransfers()
+{
+  m_Impl->flushTransfers();
 }
 
 } // namespace Sky::RHI

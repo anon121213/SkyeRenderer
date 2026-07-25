@@ -46,13 +46,43 @@ VulkanDevice::VulkanDevice(const VulkanInstance& instance)
     throw std::runtime_error("Failed to find Vulkan physical device");
   }
 
-  float queuePriority = 1.0f;
+  uint32_t deviceCount = 0;
+  vkGetPhysicalDeviceQueueFamilyProperties(m_PhysicalDevice, &deviceCount, nullptr);
+  std::vector<VkQueueFamilyProperties> queueFamilies(deviceCount);
+  vkGetPhysicalDeviceQueueFamilyProperties(m_PhysicalDevice, &deviceCount, queueFamilies.data());
 
-  VkDeviceQueueCreateInfo queueCreateInfo = {};
-  queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-  queueCreateInfo.queueFamilyIndex = m_GraphicsFamily;
-  queueCreateInfo.pQueuePriorities = &queuePriority;
-  queueCreateInfo.queueCount = 1;
+  for (uint32_t i = 0; i < queueFamilies.size(); ++i)
+  {
+    if ((queueFamilies[i].queueFlags & VK_QUEUE_TRANSFER_BIT) != 0 &&
+        (queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0 &&
+        (queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT)  == 0)
+    {
+      m_TransferFamily = i;
+      m_HasDedicatedTransfer = true;
+    }
+  }
+
+  float graphicsQueuePriority = 1.0f;
+  float transferQueuePriority = 0.5f;
+
+  std::vector<VkDeviceQueueCreateInfo> queueInfos;
+
+  VkDeviceQueueCreateInfo queueGraphicsCreateInfo = {};
+  queueGraphicsCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+  queueGraphicsCreateInfo.queueFamilyIndex = m_GraphicsFamily;
+  queueGraphicsCreateInfo.pQueuePriorities = &graphicsQueuePriority;
+  queueGraphicsCreateInfo.queueCount = 1;
+  queueInfos.push_back(queueGraphicsCreateInfo);
+
+  if (m_HasDedicatedTransfer)
+  {
+    VkDeviceQueueCreateInfo queueTransferCreateInfo = {};
+    queueTransferCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    queueTransferCreateInfo.queueFamilyIndex = m_TransferFamily;
+    queueTransferCreateInfo.pQueuePriorities = &transferQueuePriority;
+    queueTransferCreateInfo.queueCount = 1;
+    queueInfos.push_back(queueTransferCreateInfo);
+  }
 
   uint32_t deviceExtensionCount = 0;
   vkEnumerateDeviceExtensionProperties(m_PhysicalDevice, nullptr, &deviceExtensionCount, nullptr);
@@ -73,14 +103,19 @@ VulkanDevice::VulkanDevice(const VulkanInstance& instance)
 
   VkPhysicalDeviceFeatures features{};
 
+  VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeature{};
+  timelineFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+  timelineFeature.timelineSemaphore = VK_TRUE;
+
   VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamicRenderingFeature{};
   dynamicRenderingFeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR;
   dynamicRenderingFeature.dynamicRendering = VK_TRUE;
+  dynamicRenderingFeature.pNext = &timelineFeature;
 
   VkDeviceCreateInfo deviceCreateInfo = {};
   deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-  deviceCreateInfo.queueCreateInfoCount = 1;
-  deviceCreateInfo.pQueueCreateInfos = &queueCreateInfo;
+  deviceCreateInfo.queueCreateInfoCount = static_cast<uint32_t>(queueInfos.size());
+  deviceCreateInfo.pQueueCreateInfos = queueInfos.data();
   deviceCreateInfo.pNext = &dynamicRenderingFeature;
   deviceCreateInfo.pEnabledFeatures = &features;
   deviceCreateInfo.enabledExtensionCount = static_cast<uint32_t>(extensionNames.size());
@@ -122,8 +157,13 @@ VulkanDevice::VulkanDevice(const VulkanInstance& instance)
                "Failed to create VMA allocator");
 
   vkGetDeviceQueue(m_Device, m_GraphicsFamily, 0, &m_GraphicsQueue);
+  if (m_HasDedicatedTransfer)
+    vkGetDeviceQueue(m_Device, m_TransferFamily, 0, &m_TransferQueue);
+  else
+    m_TransferQueue = m_GraphicsQueue;
 
-  SKY_RHI_INFO("Logical device created, graphics queue family = {}", m_GraphicsFamily);
+  SKY_RHI_INFO("Transfer queue: family = {} ({})", m_TransferFamily,
+             m_HasDedicatedTransfer ? "dedicated DMA" : "fallback to graphics");
 }
 
 VulkanDevice::~VulkanDevice()

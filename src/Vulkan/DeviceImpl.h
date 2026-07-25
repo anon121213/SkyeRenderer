@@ -33,6 +33,13 @@ struct VulkanSwapchainEntry
       , swapchain(device, surface, width, height) {}
 };
 
+struct PendingUpload
+{
+  std::unique_ptr<VulkanBuffer> staging;
+  VkCommandBuffer               cmd    = VK_NULL_HANDLE;
+  uint64_t                      target = 0;
+};
+
 struct Device::Impl
 {
   VulkanInstance      instance;
@@ -46,11 +53,15 @@ struct Device::Impl
 
   VulkanCommandPool   commandPool;
 
-  VkCommandBuffer          commandBuffer  = VK_NULL_HANDLE;
-  VkSemaphore              imageAvailable = VK_NULL_HANDLE;
-  std::vector<VkSemaphore> renderFinished;   // one per swapchain image
-  VkFence                  inFlight       = VK_NULL_HANDLE;
-  uint32_t                 currentImageIndex = 0;   // Backbuffer acquired this frame (for FG realization)
+  VkCommandBuffer          commandBuffer     = VK_NULL_HANDLE;
+  VkSemaphore              imageAvailable    = VK_NULL_HANDLE;
+  std::vector<VkSemaphore> renderFinished;
+
+  VkFence                  inFlight          = VK_NULL_HANDLE;
+  uint32_t                 currentImageIndex = 0;
+
+  VkSemaphore              transferTimeline  = VK_NULL_HANDLE;
+  uint64_t                 transferValue     = 0;
 
   HandleAllocator<BufferHandle, VulkanBuffer> bufferPool;
 
@@ -67,16 +78,40 @@ struct Device::Impl
 
   std::vector<std::unique_ptr<VulkanImage>> frameTransients;
 
+  std::vector<PendingUpload> pendingUploads;
+
+  [[nodiscard]] uint64_t uploadTextureDataAsync(TextureHandle handle, const void* data, size_t size);
+
+  void collectFinishedTransfers()
+  {
+    if (pendingUploads.empty()) return;
+
+    uint64_t completed = 0;
+    vkGetSemaphoreCounterValue(device.handle(), transferTimeline, &completed);
+
+    std::vector<PendingUpload> stillPending;
+    for (auto& u : pendingUploads)
+    {
+      if (u.target <= completed)
+        commandPool.free(u.cmd);
+      else
+        stillPending.push_back(std::move(u));
+    }
+    pendingUploads = std::move(stillPending);
+  }
+
   [[nodiscard]] CommandList createCommandList(VkCommandBuffer cmd) noexcept
   {
     return {cmd, this};
   }
 
-  void beginFrame();   // wait fence, acquire -> currentImageIndex, begin command buffer
-  void endFrame();     // end command buffer, submit, present
+  void beginFrame();
+  void endFrame();
   void waitIdle() const;
 
   void immediateSubmit(const std::function<void(VkCommandBuffer)>& record);
+  void flushTransfers();
+
 
   explicit Impl(const DeviceCreateInfo& info);
   ~Impl();
