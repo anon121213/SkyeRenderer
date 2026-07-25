@@ -79,6 +79,7 @@ public:
   [[nodiscard]] DescriptorSetHandle createDescriptorSet(DescriptorSetLayoutHandle layout);
   void destroyDescriptorSet(DescriptorSetHandle handle);
   void updateDescriptorSetTexture(DescriptorSetHandle setHandler, uint32_t binding, TextureHandle textureHandle, SamplerHandle samplerHandle);
+  void updateDescriptorSetBuffer(DescriptorSetHandle setHandler, uint32_t binding, BufferHandle bufferHandle, uint64_t range, uint64_t offset = 0);
 
   struct Impl;
 

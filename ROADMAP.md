@@ -16,7 +16,7 @@
 - Frame Graph с автоматическими барьерами
 - Multi-window, multi-queue, multi-thread ready
 
-Timeline: **6-9 месяцев** при 2-4ч/день до полноценного AAA-рендерера с PBR + пути к RT.
+Timeline (обновлено 2026-07-20 под реальный темп user'а — 14-40ч/нед): core (PBR → path tracer, Phase 4-11) ~1.5-2 мес @40ч/нед; полный scope (+Lumen +Nanite +DX12/DLSS) ~4-7 мес.
 
 ---
 
@@ -104,6 +104,13 @@ Sky::Graphics::Mesh mesh(device, vertices, indices);
 ### Backend abstraction — postponed
 
 Пока backend один (Vulkan), полиморфизм / PIMPL НЕ вводим. Публичный API остаётся backend-agnostic по семантике (никаких `VkFoo` в сигнатурах), реализация — прямо через Vulkan без промежуточных слоёв. Когда добавим D3D12 — introduce polymorphism inside Device.
+
+### Ray tracing, upscaling & hardware targets (added 2026-07-20)
+
+- **RT — compute/software-based (primary path).** Mac (MoltenVK) не даёт hardware RT в Vulkan (M3 GPU имеет HW RT, но только через Metal — MoltenVK не пробрасывает Vulkan RT extensions). Path tracer (Phase 11) и Lumen-style GI (Phase 12) реализуем через **compute** (свой BVH traversal / SDF tracing). Работает на любом GPU.
+- **Hardware RT — опционально, через будущий RTX-ноут.** Планируется купить дешёвый RTX laptop (40-серия ради DLSS 3 Frame Generation) под Windows/DX12 ветку. Тогда тот же path tracer/Lumen ускоряется через `vkCmdTraceRaysKHR`/DXR. API проектируем так, чтобы HW-путь подключался без переписывания.
+- **Upscaling: FSR (primary, cross-vendor, compute — идёт на Mac) + DLSS (на RTX-железе).** DLSS = только NVIDIA RTX (нет ни на Mac, ни на текущем Intel-ноуте Ultra 7 155H / iGPU). DLSS 2 — любые RTX; DLSS 3 Frame Gen — только 40-серия; DLSS 3.5 Ray Reconstruction — все RTX. XeSS — cross-vendor опция.
+- **Dev-машина для RT/GI — Mac M3 Max** (мощный GPU, compute отлично идёт). Windows-ноут (Intel Ultra 7 155H, iGPU) — только smoke-test DX12 backend, не для тяжёлого GI (будет слайдшоу).
 
 ---
 
@@ -424,13 +431,63 @@ SkyRenderer/                                ← standalone framework, git submod
 
 ---
 
+### Phase 12: Lumen-style Real-Time GI
+
+**Оценка:** ~40-70ч
+
+**Цель:** динамическая global illumination в реалтайме **без hardware RT**, сверяемая с path tracer'ом (Phase 11) как ground-truth эталоном.
+
+**Задачи:**
+- [ ] Signed Distance Fields генерация — per-mesh SDF (compute bake)
+- [ ] Global merged distance field сцены
+- [ ] Software ray tracing против SDF (compute) — diffuse GI rays, без треугольного BVH
+- [ ] Screen-space traces (по depth/normal) для near field
+- [ ] Surface cache / radiance caching — переиспользование освещённости между кадрами
+- [ ] Temporal accumulation + denoising
+- [ ] Reflections через те же traces
+- [ ] Сравнение с path tracer ground truth (валидация качества)
+
+**Результат:** реалтайм динамическая GI — двигаешь свет/объекты, освещение и отражения обновляются. Lumen-style, на compute.
+
+---
+
+### Phase 13: Nanite-style Virtualized Geometry
+
+**Оценка:** ~60-120ч (по сути отдельный проект — держим последним)
+
+**Цель:** виртуализованная геометрия — миллионы/миллиарды треугольников, авто-LOD без швов и попапа.
+
+**Задачи:**
+- [ ] Meshlet building — разбиение меша на кластеры ~128 треугольников
+- [ ] Cluster quantization / compression — позиции квантованы относительно bounds кластера
+- [ ] **Hierarchical LOD DAG** — группировка кластеров, упрощение через границы групп, seamless LOD (ядро Nanite, самое сложное)
+- [ ] GPU cluster culling (frustum + occlusion HiZ) — переиспользует Phase 9
+- [ ] **Software rasterizer** (compute) для микро-треугольников → visibility buffer (64-bit: depth + cluster/tri ID)
+- [ ] Hardware rasterizer для крупных кластеров (гибридный путь)
+- [ ] Material pass из visibility buffer (deferred-style shading)
+- [ ] Streaming кластеров (подгрузка по нужному LOD)
+
+**Результат:** Nanite-style — детализированные модели без LOD-попапа, полигонаж почти не влияет на перф.
+
+---
+
+## Windows / DX12 ветка (требует RTX-железа)
+
+Планируется дешёвый RTX-ноут (40-серия ради DLSS 3). Делается параллельно/после core. RHI уже backend-agnostic — DX12 это второй backend, не рендерер с нуля. Заодно **«экзамен на самостоятельность»** для user'а (пишет с минимумом ведения).
+
+- [ ] **DX12 backend** — второй backend к существующему RHI API
+- [ ] **DLSS** — NVIDIA upscaling (только RTX; 40-серия для Frame Generation)
+- [ ] **Hardware RT path** — `vkCmdTraceRaysKHR` / DXR для ускорения path tracer + Lumen на RTX
+- [ ] **Full mesh shaders** — на MoltenVK частично (Metal 3), полноценно на Windows/DX12
+- [ ] **Descriptor buffer** (`VK_EXT_descriptor_buffer`) — не на MoltenVK, только Windows/DX12
+
+---
+
 ## Отложено (когда захочется)
 
-- **Mesh shaders** — Vulkan 1.3, modern geometry pipeline
-- **VK_KHR_maintenance5**, **VK_KHR_dynamic_rendering** — alternative pipelines
-- **Descriptor buffer** — modern descriptor management
-- **DLSS/FSR integration** — upscaling
-- **Nanite-style geometry** — если полезу в endgame
+- **FSR 2/3** — cross-vendor upscaler (compute, идёт на Mac); логично после Phase 8 (нужны motion vectors)
+- **XeSS** — Intel cross-vendor upscaler (альтернатива/дополнение FSR)
+- **VK_KHR_maintenance5** — modern conveniences
 
 ---
 

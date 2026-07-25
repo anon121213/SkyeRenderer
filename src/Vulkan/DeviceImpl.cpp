@@ -438,4 +438,32 @@ void Device::updateDescriptorSetTexture(DescriptorSetHandle setHandler, uint32_t
   vkUpdateDescriptorSets(m_Impl->device.handle(), 1, &write, 0, nullptr);
 }
 
+void Device::updateDescriptorSetBuffer(DescriptorSetHandle setHandler, uint32_t binding,
+                                       BufferHandle bufferHandle, uint64_t range, uint64_t offset)
+{
+  VulkanDescriptorSet* set    = m_Impl->descriptorSetPool.resolve(setHandler);
+  VulkanBuffer*        buffer = m_Impl->bufferPool.resolve(bufferHandle);
+
+  if (!set || !buffer)
+  {
+    SKY_RHI_ERROR("updateDescriptorSetBuffer: invalid handle");
+    return;
+  }
+
+  VkDescriptorBufferInfo bufferInfo{};
+  bufferInfo.buffer = buffer->handle();
+  bufferInfo.offset = offset;
+  bufferInfo.range = range;
+
+  VkWriteDescriptorSet write{};
+  write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  write.dstSet = set->handle();
+  write.dstBinding = binding;
+  write.descriptorCount = 1;
+  write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  write.pBufferInfo = &bufferInfo;
+
+  vkUpdateDescriptorSets(m_Impl->device.handle(), 1, &write, 0, nullptr);
+}
+
 } // namespace Sky::RHI

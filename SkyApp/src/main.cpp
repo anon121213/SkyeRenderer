@@ -23,9 +23,24 @@ static std::vector<uint32_t> loadSpirv(const std::string& path)
   return buffer;
 }
 
-struct Vertex {
+struct
+Vertex {
   float pos[3];
   float uv[2];
+  float normal[3];
+};
+
+struct PushConstants
+{
+  glm::mat4 mvp;
+  glm::mat4 model;
+};
+
+struct SceneData
+{
+  glm::vec3 lightDir; float _pad0;
+  glm::vec3 lightColor; float _pad1;
+  glm::vec3 camPos; float _pad2;
 };
 
 int main()
@@ -51,6 +66,10 @@ int main()
 
     Sky::RHI::Device device(info);
 
+    auto pack = [](uint8_t r, uint8_t g, uint8_t b, uint8_t a) -> uint32_t {
+      return uint32_t(r) | (uint32_t(g) << 8) | (uint32_t(b) << 16) | (uint32_t(a) << 24);
+    };
+
     // перед device, или в try после device:
     constexpr uint32_t TEX = 256;
     std::vector<uint32_t> pixels(TEX * TEX);
@@ -64,18 +83,41 @@ int main()
     auto texture = device.createTexture({ Sky::RHI::Format::RGBA8_UNORM, TEX, TEX, Sky::RHI::TextureUsage::Sampled });
     device.uploadTextureData(texture, pixels.data(), pixels.size() * sizeof(uint32_t));
 
+    constexpr uint32_t TEXMETALLIC = 256;
+    std::vector<uint32_t> pixelsMetallic(TEXMETALLIC * TEXMETALLIC);
+    for (uint32_t y = 0; y < TEXMETALLIC; ++y)
+      for (uint32_t x = 0; x < TEXMETALLIC; ++x)
+      {
+        if (x < 128)
+          pixelsMetallic[y * TEXMETALLIC + x] = pack(0, /*rough*/ 25, /*metal*/ 255, 255);
+        else
+          pixelsMetallic[y * TEXMETALLIC + x] = pack(0, /*rough*/ 204, /*metal*/ 0, 255);
+      }
+
+    auto textureMetallic = device.createTexture({ Sky::RHI::Format::RGBA8_UNORM, TEXMETALLIC, TEXMETALLIC, Sky::RHI::TextureUsage::Sampled });
+    device.uploadTextureData(textureMetallic, pixelsMetallic.data(), pixelsMetallic.size() * sizeof(uint32_t));
+
     auto sampler = device.createSampler({});
 
     Sky::RHI::DescriptorSetLayoutDesc layoutDesc{};
     layoutDesc.bindings = {
-      {
-        0, Sky::RHI::DescriptorType::CombinedImageSampler,
-        Sky::RHI::ShaderStage::Fragment
-      } };
+      { 0, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment }, // albedo
+      { 1, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment }, // metalRough
+      { 2, Sky::RHI::DescriptorType::UniformBuffer,        Sky::RHI::ShaderStage::Fragment }, // scene
+    };
     auto descLayout = device.createDescriptorSetLayout(layoutDesc);
+
+    const auto sceneUBO = device.createBuffer({
+      sizeof(SceneData),
+      Sky::RHI::BufferUsage::Uniform,
+      Sky::RHI::MemoryType::CpuToGpu});
+
+    void* sceneMapped = device.mapBuffer(sceneUBO);
 
     auto descSet = device.createDescriptorSet(descLayout);
     device.updateDescriptorSetTexture(descSet, 0, texture, sampler);
+    device.updateDescriptorSetTexture(descSet, 1, textureMetallic, sampler);
+    device.updateDescriptorSetBuffer(descSet, 2, sceneUBO, sizeof(SceneData));
 
     auto vertCode = loadSpirv(std::string(SHADER_DIR) + "/triangle.vert.spv");
     auto fragCode = loadSpirv(std::string(SHADER_DIR) + "/triangle.frag.spv");
@@ -88,6 +130,7 @@ int main()
     const std::vector<Sky::RHI::VertexAttribute> attrs = {
       { 0, Sky::RHI::Format::RGB32_SFLOAT, offsetof(Vertex, pos) },   // location 0 = pos
       { 1, Sky::RHI::Format::RG32_SFLOAT,  offsetof(Vertex, uv)  },   // location 1 = uv
+      { 2, Sky::RHI::Format::RGB32_SFLOAT, offsetof(Vertex, normal) } // location 2 = normal
     };
 
     Sky::RHI::GraphicsPipelineDesc pipeDesc{};
@@ -97,24 +140,24 @@ int main()
     pipeDesc.vertexAttributes    = attrs;
     pipeDesc.colorFormat         = device.swapchainFormat(sw);  // matching swapchain format
     pipeDesc.depthFormat         = Sky::RHI::Format::D32_SFLOAT;
-    pipeDesc.pushConstantSize    = sizeof(glm::mat4);
+    pipeDesc.pushConstantSize    = sizeof(PushConstants);
     pipeDesc.descriptorSetLayout = descLayout;
 
     const auto pipeline = device.createGraphicsPipeline(pipeDesc);
 
     const Vertex verts[24] = {
       // front (z=-0.5)
-      {{-0.5f,-0.5f,-0.5f},{0,0}}, {{ 0.5f,-0.5f,-0.5f},{1,0}}, {{ 0.5f, 0.5f,-0.5f},{1,1}}, {{-0.5f, 0.5f,-0.5f},{0,1}},
+      {{-0.5f,-0.5f,-0.5f},{0,0}, {0, 0, -1}}, {{ 0.5f,-0.5f,-0.5f},{1,0}, {0, 0, -1}}, {{ 0.5f, 0.5f,-0.5f},{1,1}, {0, 0, -1}}, {{-0.5f, 0.5f,-0.5f},{0,1}, {0, 0, -1}},
       // back (z=+0.5)
-      {{ 0.5f,-0.5f, 0.5f},{0,0}}, {{-0.5f,-0.5f, 0.5f},{1,0}}, {{-0.5f, 0.5f, 0.5f},{1,1}}, {{ 0.5f, 0.5f, 0.5f},{0,1}},
+      {{ 0.5f,-0.5f, 0.5f},{0,0}, { 0, 0, 1}}, {{-0.5f,-0.5f, 0.5f},{1,0}, { 0, 0, 1}}, {{-0.5f, 0.5f, 0.5f},{1,1}, { 0, 0, 1}}, {{ 0.5f, 0.5f, 0.5f},{0,1}, { 0, 0, 1}},
       // left (x=-0.5)
-      {{-0.5f,-0.5f, 0.5f},{0,0}}, {{-0.5f,-0.5f,-0.5f},{1,0}}, {{-0.5f, 0.5f,-0.5f},{1,1}}, {{-0.5f, 0.5f, 0.5f},{0,1}},
+      {{-0.5f,-0.5f, 0.5f},{0,0}, {-1, 0, 0}}, {{-0.5f,-0.5f,-0.5f},{1,0}, {-1, 0, 0}}, {{-0.5f, 0.5f,-0.5f},{1,1}, {-1, 0, 0}}, {{-0.5f, 0.5f, 0.5f},{0,1}, {-1, 0, 0}},
       // right (x=+0.5)
-      {{ 0.5f,-0.5f,-0.5f},{0,0}}, {{ 0.5f,-0.5f, 0.5f},{1,0}}, {{ 0.5f, 0.5f, 0.5f},{1,1}}, {{ 0.5f, 0.5f,-0.5f},{0,1}},
+      {{ 0.5f,-0.5f,-0.5f},{0,0}, { 1, 0, 0}}, {{ 0.5f,-0.5f, 0.5f},{1,0}, { 1, 0, 0}}, {{ 0.5f, 0.5f, 0.5f},{1,1}, { 1, 0, 0}}, {{ 0.5f, 0.5f,-0.5f},{0,1}, { 1, 0, 0}},
       // top (y=+0.5)
-      {{-0.5f, 0.5f,-0.5f},{0,0}}, {{ 0.5f, 0.5f,-0.5f},{1,0}}, {{ 0.5f, 0.5f, 0.5f},{1,1}}, {{-0.5f, 0.5f, 0.5f},{0,1}},
+      {{-0.5f, 0.5f,-0.5f},{0,0}, { 0, 1, 0}}, {{ 0.5f, 0.5f,-0.5f},{1,0}, { 0, 1, 0}}, {{ 0.5f, 0.5f, 0.5f},{1,1}, { 0, 1, 0}}, {{-0.5f, 0.5f, 0.5f},{0,1}, { 0, 1, 0}},
       // bottom (y=-0.5)
-      {{-0.5f,-0.5f, 0.5f},{0,0}}, {{ 0.5f,-0.5f, 0.5f},{1,0}}, {{ 0.5f,-0.5f,-0.5f},{1,1}}, {{-0.5f,-0.5f,-0.5f},{0,1}},
+      {{-0.5f,-0.5f, 0.5f},{0,0}, {0, -1, 0}}, {{ 0.5f,-0.5f, 0.5f},{1,0}, {0, -1, 0}}, {{ 0.5f,-0.5f,-0.5f},{1,1}, {0, -1, 0}}, {{-0.5f,-0.5f,-0.5f},{0,1}, {0, -1, 0}},
     };
 
     const uint16_t indices[36] = {
@@ -168,6 +211,19 @@ int main()
 
       glm::mat4 mvp = proj * view * model;
 
+      PushConstants pushConstants = {
+        .mvp = mvp,
+        .model = model,
+      };
+
+      glm::vec3 lightPos = glm::vec3(cos(time) * 2.0f, 1.0f, sin(time) * 2.0f);
+
+      SceneData scene{};                              // {} — зануляет паддинг тоже
+      scene.lightDir   = glm::normalize(lightPos);    // направление НА свет
+      scene.lightColor = glm::vec3(1.0f);
+      scene.camPos     = glm::vec3(0.0f, 0.0f, 2.0f);
+      memcpy(sceneMapped, &scene, sizeof(SceneData));
+
       Sky::RHI::FrameGraph fg(device);
       fg.addRasterPass<TriData>("Triangle",
         [&](Sky::RHI::PassBuilder& b, TriData& d) {
@@ -178,7 +234,7 @@ int main()
         [&](const TriData&, Sky::RHI::FGResources&, Sky::RHI::CommandList& cmd) {
           cmd.bindPipeline(pipeline);
           cmd.bindDescriptorSet(descSet);
-          cmd.pushConstants(&mvp, sizeof(mvp));
+          cmd.pushConstants(&pushConstants, sizeof(PushConstants));
           cmd.bindVertexBuffer(vb);
           cmd.bindIndexBuffer(ib, Sky::RHI::IndexType::UInt16);
           cmd.setViewport(0.0f, 0.0f, static_cast<float>(extent.width), static_cast<float>(extent.height));
@@ -192,6 +248,9 @@ int main()
     }
 
     device.waitIdle();
+
+    device.unmapBuffer(sceneUBO);
+    device.destroyBuffer(sceneUBO);
 
     device.destroyBuffer(ib);
     device.destroyBuffer(vb);
