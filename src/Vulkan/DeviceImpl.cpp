@@ -24,7 +24,8 @@ std::unique_ptr<Sky::RHI::VulkanSwapchainEntry> makeSwapchainEntry(
 void transitionImageLayout(VkCommandBuffer cmd, VkImage image,
                            VkImageLayout oldLayout, VkImageLayout newLayout,
                            VkAccessFlags srcAccess, VkAccessFlags dstAccess,
-                           VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage)
+                           VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage,
+                           uint32_t mipLevel = 0)
 {
   VkImageMemoryBarrier b{};
   b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -35,7 +36,7 @@ void transitionImageLayout(VkCommandBuffer cmd, VkImage image,
   b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   b.image = image;
-  b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+  b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, mipLevel, 1, 0, 1 };
   vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
 
@@ -309,6 +310,66 @@ void Device::Impl::flushTransfers()
   pendingUploads.clear();
 }
 
+void Device::Impl::renderToTexture(VulkanImage* target, uint32_t width, uint32_t height,
+                                   PipelineHandle pipeline, DescriptorSetHandle descSet,
+                                   const void* push, uint32_t push_size, uint32_t mipLevel)
+{
+  VkCommandBuffer cmd = commandPool.allocatePrimary();
+  VkCommandBufferBeginInfo begin{};
+  begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vkBeginCommandBuffer(cmd, &begin);
+
+  transitionImageLayout(cmd, target->handle(),
+    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, mipLevel);
+
+  VkImageView mipView = target->createMipView(mipLevel);
+
+  VkRenderingAttachmentInfo att{};
+  att.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+  att.imageView = mipView;
+  att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  att.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+  VkRenderingInfo ri{};
+  ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+  ri.renderArea = { {0,0}, {width,height} };
+  ri.layerCount = 1;
+  ri.colorAttachmentCount = 1;
+  ri.pColorAttachments = &att;
+
+  vkCmdBeginRenderingKHR(cmd, &ri);
+
+  CommandList list = createCommandList(cmd);
+  list.bindPipeline(pipeline);
+  if (descriptorSetPool.resolve(descSet)) list.bindDescriptorSet(descSet);
+  if (push) list.pushConstants(push, push_size);
+  list.setViewport(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height));
+  list.setScissor(0, 0, width, height);
+  list.draw(3);
+
+  vkCmdEndRenderingKHR(cmd);
+
+  transitionImageLayout(cmd, target->handle(),
+    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, mipLevel);
+
+  vkEndCommandBuffer(cmd);
+
+  VkSubmitInfo submit{};
+  submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submit.commandBufferCount = 1;
+  submit.pCommandBuffers = &cmd;
+  vkQueueSubmit(device.graphicQueue(), 1, &submit, VK_NULL_HANDLE);
+  vkQueueWaitIdle(device.graphicQueue());
+  commandPool.free(cmd);
+  vkDestroyImageView(device.handle(), mipView, nullptr);
+}
+
 void Device::Impl::waitIdle() const
 {
   vkDeviceWaitIdle(device.handle());
@@ -475,7 +536,7 @@ TextureHandle Device::createTexture(const TextureDesc& desc)
   return m_Impl->texturePool.allocate(std::make_unique<VulkanImage>(
     m_Impl->device.allocator(), m_Impl->device.handle(),
     toVkFormat(desc.format), desc.width, desc.height,
-    usage, VK_IMAGE_ASPECT_COLOR_BIT));
+    usage, VK_IMAGE_ASPECT_COLOR_BIT, desc.mipLevels));
 }
 
 void Device::destroyTexture(TextureHandle handle) noexcept
@@ -620,6 +681,14 @@ void Device::updateDescriptorSetBuffer(DescriptorSetHandle setHandler, uint32_t 
 void Device::flushTransfers()
 {
   m_Impl->flushTransfers();
+}
+
+void Device::renderToTexture(TextureHandle target, uint32_t width, uint32_t height,
+                             PipelineHandle pipeline, DescriptorSetHandle descSet,
+                             const void* push, uint32_t push_size, uint32_t mipLevel)
+{
+  VulkanImage* texture = m_Impl->texturePool.resolve(target);
+  m_Impl->renderToTexture(texture, width, height, pipeline, descSet, push, push_size, mipLevel);
 }
 
 } // namespace Sky::RHI

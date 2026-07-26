@@ -112,7 +112,9 @@ struct Device::Impl
 
   void immediateSubmit(const std::function<void(VkCommandBuffer)>& record);
   void flushTransfers();
-
+  void renderToTexture(VulkanImage* target, uint32_t width, uint32_t height,
+                       PipelineHandle pipeline, DescriptorSetHandle descSet,
+                       const void* push, uint32_t push_size, uint32_t mipLevel = 0);
 
   explicit Impl(const DeviceCreateInfo& info);
   ~Impl();

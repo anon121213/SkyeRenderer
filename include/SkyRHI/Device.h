@@ -90,6 +90,10 @@ public:
   void updateDescriptorSetBuffer(DescriptorSetHandle setHandler, uint32_t binding, BufferHandle bufferHandle, uint64_t range, uint64_t offset = 0);
   void flushTransfers();
 
+  void renderToTexture(TextureHandle target, uint32_t width, uint32_t height,
+                       PipelineHandle pipeline, DescriptorSetHandle descSet,
+                       const void* push, uint32_t push_size, uint32_t mipLevel = 0);
+
   struct Impl;
 
 private:

@@ -125,6 +125,7 @@ int main()
     auto texture         = makeTexture(model.albedo);      // baseColor
     auto textureMetallic = makeTexture(model.metalRough);  // G=roughness, B=metallic
     auto textureNormal   = makeTexture(model.normal);      // tangent-space normals
+
     auto envTex = device.createTexture({
       .format = Sky::RHI::Format::RGBA32_SFLOAT,
       .width = env.width,
@@ -132,6 +133,29 @@ int main()
       .usage = Sky::RHI::TextureUsage::Sampled,
     });
     device.uploadTextureData(envTex, env.pixels.data(), env.pixels.size() * sizeof(float));
+
+    auto brdfLut = device.createTexture({
+    Sky::RHI::Format::RG16_SFLOAT, 512, 512,
+    Sky::RHI::TextureUsage::ColorAttachment | Sky::RHI::TextureUsage::Sampled });
+
+    auto brdfFragCode = loadSpirv(std::string(SHADER_DIR) + "/brdf.frag.spv");
+    auto brdfFs = device.createShader({ brdfFragCode.data(), brdfFragCode.size() * sizeof(uint32_t) });
+
+    auto irradianceMap = device.createTexture({
+    Sky::RHI::Format::RGBA16_SFLOAT, 64, 32,
+    Sky::RHI::TextureUsage::ColorAttachment | Sky::RHI::TextureUsage::Sampled });
+
+    auto irrFragCode = loadSpirv(std::string(SHADER_DIR) + "/irradiance.frag.spv");
+    auto irrFs = device.createShader({ irrFragCode.data(), irrFragCode.size() * sizeof(uint32_t) });
+
+    const uint32_t PREFILTER_MIPS = 6;
+    auto prefilteredMap = device.createTexture({
+      Sky::RHI::Format::RGBA16_SFLOAT, 256, 128,
+      Sky::RHI::TextureUsage::ColorAttachment | Sky::RHI::TextureUsage::Sampled,
+      PREFILTER_MIPS });                            // ← mipLevels
+
+    auto preFragCode = loadSpirv(std::string(SHADER_DIR) + "/prefilter.frag.spv");
+    auto preFs = device.createShader({ preFragCode.data(), preFragCode.size() * sizeof(uint32_t) });
 
     auto sampler = device.createSampler({});
 
@@ -154,6 +178,9 @@ int main()
       { 1, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment }, // metalRough
       { 2, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment }, // normalMap
       { 3, Sky::RHI::DescriptorType::UniformBuffer,        Sky::RHI::ShaderStage::Fragment }, // scene
+      { 4, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment }, // irradiance
+      { 5, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment }, // prefiltered
+      { 6, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment }, // brdfLut
     };
     auto descLayout = device.createDescriptorSetLayout(layoutDesc);
 
@@ -169,6 +196,9 @@ int main()
     device.updateDescriptorSetTexture(descSet, 1, textureMetallic, sampler);
     device.updateDescriptorSetTexture(descSet, 2, textureNormal, sampler);
     device.updateDescriptorSetBuffer(descSet, 3, sceneUBO, sizeof(SceneData));
+    device.updateDescriptorSetTexture(descSet, 4, irradianceMap,  sampler);
+    device.updateDescriptorSetTexture(descSet, 5, prefilteredMap, sampler);
+    device.updateDescriptorSetTexture(descSet, 6, brdfLut,        sampler);
 
     auto vertCode = loadSpirv(std::string(SHADER_DIR) + "/triangle.vert.spv");
     auto fragCode = loadSpirv(std::string(SHADER_DIR) + "/triangle.frag.spv");
@@ -208,12 +238,50 @@ int main()
     skyDesc.depthWrite          = false;
     auto skyPipeline = device.createGraphicsPipeline(skyDesc);
 
+    Sky::RHI::GraphicsPipelineDesc brdfDesc{};
+    brdfDesc.vertexShader   = skyVs;
+    brdfDesc.fragmentShader = brdfFs;
+    brdfDesc.vertexStride   = 0;
+    brdfDesc.colorFormat    = Sky::RHI::Format::RG16_SFLOAT;
+    brdfDesc.depthFormat    = Sky::RHI::Format::Undefined;
+    auto brdfPipeline = device.createGraphicsPipeline(brdfDesc);
+
+    device.renderToTexture(brdfLut, 512, 512, brdfPipeline, {}, nullptr, 0);
+
+    Sky::RHI::GraphicsPipelineDesc irrDesc{};
+    irrDesc.vertexShader        = skyVs;
+    irrDesc.fragmentShader      = irrFs;
+    irrDesc.vertexStride        = 0;
+    irrDesc.colorFormat         = Sky::RHI::Format::RGBA16_SFLOAT;
+    irrDesc.depthFormat         = Sky::RHI::Format::Undefined;
+    irrDesc.descriptorSetLayout = skyLayout;
+    auto irrPipeline = device.createGraphicsPipeline(irrDesc);
+
+    device.renderToTexture(irradianceMap, 64, 32, irrPipeline, skyDescSet, nullptr, 0);
+
+    Sky::RHI::GraphicsPipelineDesc preDesc{};
+    preDesc.vertexShader        = skyVs;
+    preDesc.fragmentShader      = preFs;
+    preDesc.vertexStride        = 0;
+    preDesc.colorFormat         = Sky::RHI::Format::RGBA16_SFLOAT;
+    preDesc.depthFormat         = Sky::RHI::Format::Undefined;
+    preDesc.descriptorSetLayout = skyLayout;                     // env на set0 binding0
+    preDesc.pushConstantSize    = sizeof(float);                 // roughness
+    auto prefilterPipeline = device.createGraphicsPipeline(preDesc);
+
+    for (uint32_t mip = 0; mip < PREFILTER_MIPS; ++mip) {
+      uint32_t w = 256u >> mip;
+      uint32_t h = 128u >> mip;
+      float roughness = float(mip) / float(PREFILTER_MIPS - 1);
+      device.renderToTexture(prefilteredMap, w, h, prefilterPipeline, skyDescSet,
+                             &roughness, sizeof(float), mip);
+    }
+
     // --- ImGui init (Vulkan backend via dynamic rendering; GLFW input backend) ---
     VkDescriptorPool imguiPool = VK_NULL_HANDLE;
     ImGui_ImplVulkan_InitInfo imguiInfo{};
     InitImGui(window, device, &imguiPool, &imguiInfo);
 
-    // debug-tweakable scene params (demonstrates ImGui + useful for Phase 7 tuning)
     float sunIntensity   = 2.0f;
     float pointIntensity = 8.0f;
 

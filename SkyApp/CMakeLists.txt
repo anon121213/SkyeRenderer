@@ -74,6 +74,9 @@ set(SHADERS
         ${SHADER_SRC_DIR}/triangle.frag
         ${SHADER_SRC_DIR}/skybox.vert
         ${SHADER_SRC_DIR}/skybox.frag
+        ${SHADER_SRC_DIR}/brdf.frag
+        ${SHADER_SRC_DIR}/irradiance.frag
+        ${SHADER_SRC_DIR}/prefilter.frag
 )
 
 set(SPIRV_BINARIES "")

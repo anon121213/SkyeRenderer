@@ -3,6 +3,9 @@
 layout(set = 0, binding = 0) uniform sampler2D albedo;
 layout(set = 0, binding = 1) uniform sampler2D metalRough;
 layout(set = 0, binding = 2) uniform sampler2D normalMap;
+layout(set = 0, binding = 4) uniform sampler2D irradianceMap;
+layout(set = 0, binding = 5) uniform sampler2D prefilteredMap;
+layout(set = 0, binding = 6) uniform sampler2D brdfLut;
 
 layout(set = 0, binding = 3) uniform sceneData {
     vec3 sunDir;
@@ -21,6 +24,14 @@ layout(location = 4) in float fragHandedness;
 layout(location = 0) out vec4 outColor;
 
 const float PI = 3.14159265359;
+
+vec2 dirToUv(vec3 d) {
+    return vec2(atan(d.z, d.x) / (2.0 * PI) + 0.5, acos(clamp(d.y, -1.0, 1.0)) / PI);
+}
+
+vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness) {
+    return F0 + (max(vec3(1.0 - roughness), F0) - F0) * pow(1.0 - cosTheta, 5.0);
+}
 
 // D — GGX / Trowbridge-Reitz
 float calculateD(vec3 N, vec3 H, float roughness){
@@ -83,6 +94,24 @@ void main() {
     float atten = 1.0 / (dist * dist);
     Lo += shade(Lp, scene.pointColor * atten, N, V, albedoColor, roughness, metallic);
 
-    vec3 color = Lo + albedoColor * 0.03;
+    // --- IBL ambient ---
+    float NdotV = max(dot(N, V), 0.0);
+    vec3 F0 = mix(vec3(0.04), albedoColor, metallic);
+    vec3 F  = fresnelSchlickRoughness(NdotV, F0, roughness);
+    vec3 kD = (1.0 - F) * (1.0 - metallic);
+
+    // diffuse IBL
+    vec3 diffuseIBL = texture(irradianceMap, dirToUv(N)).rgb * albedoColor;
+
+    // specular IBL
+    vec3 R = reflect(-V, N);
+    const float MAX_LOD = 5.0;                                   // PREFILTER_MIPS - 1
+    vec3 prefiltered = textureLod(prefilteredMap, dirToUv(R), roughness * MAX_LOD).rgb;
+    vec2 brdf = texture(brdfLut, vec2(NdotV, roughness)).rg;
+    vec3 specularIBL = prefiltered * (F * brdf.x + brdf.y);
+
+    vec3 ambient = kD * diffuseIBL + specularIBL;
+    vec3 color = Lo + ambient;                                   // direct + IBL
+    outColor = vec4(color, 1.0);
     outColor = vec4(color, 1.0);
 }
