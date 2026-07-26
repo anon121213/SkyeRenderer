@@ -39,6 +39,7 @@ class PassBuilder
 {
 public:
   [[nodiscard]] FGResource importSwapchain(SwapchainHandle swapchain);
+  [[nodiscard]] FGResource importColorTarget(TextureHandle texture);
   [[nodiscard]] FGResource createTexture(const char* name, const FGTextureDesc& desc);
 
   FGResource read(FGResource resource);
@@ -111,6 +112,7 @@ private:
 
   FGResource registerImportedSwapchain(SwapchainHandle swapchainHandle);
   FGResource registerTransientTexture(const char* name, const FGTextureDesc& desc);
+  FGResource registerImportedTexture(TextureHandle texture);
 
   void recordRead(uint32_t passIndex, FGResource resource);
   void recordWrite(uint32_t passIndex, FGResource resource, FGAttachmentType type);

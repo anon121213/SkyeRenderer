@@ -144,7 +144,9 @@ Sky::RHI::BufferHandle vb = device.createBuffer({...});   // POD, uint64_t
 - **НЕ реализовано (TODO для dedicated-железа, напр. RTX):** queue ownership transfer transfer→graphics + отдельный transfer command-pool. На MoltenVK не нужно (одно семейство → cmd из graphics-pool submit'ится в тот же family).
 - Streaming manager (политика: что/когда/evict) — **движковое, не RHI** (осознанно отложено). RHI даёт механизм, политику строит consumer.
 
-**ПОРЯДОК ИЗМЕНЁН: 7 идёт РАНЬШЕ 6.** Причина: Phase 6 (FG advanced: aliasing/async-compute/MT) оптимизирует много-пассовый пайплайн, которого пока нет (1 pass). Phase 7 создаёт пассы (shadow, IBL-compute, skybox) → потом Phase 6 их оптимизирует. Сначала workload, потом оптимизатор.
+**ПОРЯДОК (согласовано 2026-07-26): 7 ✅ → 8 → 6 (+frame debugger) → 9 → 10/11 → 12 → 13.**
+- Phase 8 (полишинг: tone map / bloom / TAA / AO) раньше 6 — **быстрее** (~10-15ч ядро) и **видимо** (лечит «сырой» вид, о котором user жаловался).
+- Phase 6 (FG advanced: aliasing/async-compute/MT + **compute-пайплайны которых пока нет**) двигаем к Phase 9 — там 100k объектов дают реальную нагрузку для оптимизатора (на 1 объекте оптимизировать нечего). Frame debugger идёт с Phase 6 (FG знает пассы → auto GPU-timestamp timeline).
 
 **ImGui интеграция — DONE ✅ (2026-07-26)** — фундамент debug-UI (твики Phase 7, frame debugger позже).
 - ImGui 1.91.5 через FetchContent (нет CMakeLists → static lib target `imgui` из core + imgui_impl_glfw + imgui_impl_vulkan). `IMGUI_IMPL_VULKAN_USE_VOLK` (мы на volk).

@@ -19,6 +19,11 @@ FGResource PassBuilder::importSwapchain(SwapchainHandle swapchain)
   return m_Graph->registerImportedSwapchain(swapchain);
 }
 
+FGResource PassBuilder::importColorTarget(TextureHandle texture)
+{
+  return m_Graph->registerImportedTexture(texture);
+}
+
 FGResource PassBuilder::createTexture(const char* name, const FGTextureDesc& desc)
 {
   return m_Graph->registerTransientTexture(name, desc);
@@ -47,6 +52,8 @@ struct FGResourceEntry
   std::string name;
   bool imported = false;
   SwapchainHandle importedSwapchain;
+  TextureHandle importedTexture;
+  bool importedIsTexture = false;
   FGTextureDesc desc;
 };
 
@@ -192,7 +199,7 @@ void FrameGraph::execute(CommandList& cmd)
     current = target;   // ← обновляем tracked layout
   };
 
-  std::vector<VkImageLayout> layouts(m_Impl->resources.size(), VK_IMAGE_LAYOUT_UNDEFINED);
+  std::vector layouts(m_Impl->resources.size(), VK_IMAGE_LAYOUT_UNDEFINED);
   FGResources resources;
 
   for (const uint32_t passIndex : m_Impl->executionOrder)
@@ -241,10 +248,22 @@ void FrameGraph::execute(CommandList& cmd)
         continue;
 
       FGResourceEntry& entry = m_Impl->resources[write.resource.index];
-      VulkanSwapchainEntry* sw = impl->swapchainPool.resolve(entry.importedSwapchain);
-      const VkImage image = sw->swapchain.images()[impl->currentImageIndex];
-      const VkImageView view = sw->swapchain.imageViews()[impl->currentImageIndex];
-      extent = sw->swapchain.extent();
+      VkImage image; VkImageView view;
+
+      if (entry.importedIsTexture)
+      {
+        VulkanImage* tex = impl->texturePool.resolve(entry.importedTexture);
+        image = tex->handle();
+        view = tex->view();
+        extent = { tex->width(), tex->height() };
+      }
+      else
+      {
+        VulkanSwapchainEntry* sw = impl->swapchainPool.resolve(entry.importedSwapchain);
+        image = sw->swapchain.images()[impl->currentImageIndex];
+        view = sw->swapchain.imageViews()[impl->currentImageIndex];
+        extent = sw->swapchain.extent();
+      }
 
       transition(image, layouts[write.resource.index],
         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -282,16 +301,27 @@ void FrameGraph::execute(CommandList& cmd)
 
   for (uint32_t r = 0; r < m_Impl->resources.size(); ++r)
   {
-    if (!m_Impl->resources[r].imported)
+    auto& e = m_Impl->resources[r];
+    if (!e.imported)
       continue;
 
-    VulkanSwapchainEntry* sw = impl->swapchainPool.resolve(m_Impl->resources[r].importedSwapchain);
-    const VkImage image = sw->swapchain.images()[impl->currentImageIndex];
+    if (e.importedIsTexture)
+    {
+      VulkanImage* tex = impl->texturePool.resolve(e.importedTexture);
+      transition(tex->handle(), layouts[r], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    }
+    else
+    {
+      VulkanSwapchainEntry* sw = impl->swapchainPool.resolve(m_Impl->resources[r].importedSwapchain);
+      const VkImage image = sw->swapchain.images()[impl->currentImageIndex];
 
-    transition(image, layouts[r], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0,
-      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+      transition(image, layouts[r], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    }
   }
 }
 
@@ -330,6 +360,17 @@ FGResource FrameGraph::registerTransientTexture(const char* name, const FGTextur
   const uint32_t index = static_cast<uint32_t>(m_Impl->resources.size());
   m_Impl->resources.push_back(entry);
   return FGResource{index};
+}
+
+FGResource FrameGraph::registerImportedTexture(TextureHandle texture)
+{
+  const uint32_t idx = static_cast<uint32_t>(m_Impl->resources.size());
+  FGResourceEntry entry;
+  entry.imported = true;
+  entry.importedIsTexture = true;
+  entry.importedTexture = texture;
+  m_Impl->resources.push_back(entry);
+  return FGResource{ idx };
 }
 
 void FrameGraph::recordRead(uint32_t passIndex, FGResource resource)
