@@ -89,12 +89,13 @@ VulkanPipeline::VulkanPipeline(const VulkanDevice& device,
   depthStencil.stencilTestEnable = VK_FALSE;
 
   const bool hasDepth = desc.depthFormat != Sky::RHI::Format::Undefined;
+  const bool hasColor = desc.colorFormat != Sky::RHI::Format::Undefined;
 
   VkPipelineColorBlendStateCreateInfo colorBlending{};
-  colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-  colorBlending.logicOpEnable = VK_FALSE;
-  colorBlending.attachmentCount = 1;
-  colorBlending.pAttachments = &colorBlendAttachment;
+  colorBlending.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+  colorBlending.logicOpEnable   = VK_FALSE;
+  colorBlending.attachmentCount = hasColor ? 1 : 0;
+  colorBlending.pAttachments    = hasColor ? &colorBlendAttachment : nullptr;
 
   const std::array<VkDynamicState, 2> dynamicStates = {
     VK_DYNAMIC_STATE_VIEWPORT,
@@ -126,9 +127,9 @@ VulkanPipeline::VulkanPipeline(const VulkanDevice& device,
 
   VkPipelineRenderingCreateInfoKHR renderingInfo{};
   renderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
-  renderingInfo.colorAttachmentCount = 1;
-  renderingInfo.pColorAttachmentFormats = &colorFmt;
-  renderingInfo.depthAttachmentFormat = hasDepth ? depthFmt : VK_FORMAT_UNDEFINED;
+  renderingInfo.colorAttachmentCount    = hasColor ? 1 : 0;
+  renderingInfo.pColorAttachmentFormats = hasColor ? &colorFmt : nullptr;
+  renderingInfo.depthAttachmentFormat   = hasDepth ? depthFmt : VK_FORMAT_UNDEFINED;
 
   VkGraphicsPipelineCreateInfo pipelineInfo{};
   pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;

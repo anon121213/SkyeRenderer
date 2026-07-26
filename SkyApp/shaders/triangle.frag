@@ -6,6 +6,7 @@ layout(set = 0, binding = 2) uniform sampler2D normalMap;
 layout(set = 0, binding = 4) uniform sampler2D irradianceMap;
 layout(set = 0, binding = 5) uniform sampler2D prefilteredMap;
 layout(set = 0, binding = 6) uniform sampler2D brdfLut;
+layout(set = 0, binding = 7) uniform sampler2D shadowMap;
 
 layout(set = 0, binding = 3) uniform sceneData {
     vec3 sunDir;
@@ -13,6 +14,7 @@ layout(set = 0, binding = 3) uniform sceneData {
     vec3 pointPos;
     vec3 pointColor;
     vec3 camPos;
+    mat4 lightVP;
 } scene;
 
 layout(location = 0) in vec2 fragUv;
@@ -24,6 +26,24 @@ layout(location = 4) in float fragHandedness;
 layout(location = 0) out vec4 outColor;
 
 const float PI = 3.14159265359;
+
+float calcShadow(vec4 lightSpacePos) {
+    vec3 proj = lightSpacePos.xyz / lightSpacePos.w;   // perspective divide
+    vec2 uv = proj.xy * 0.5 + 0.5;                      // xy [-1,1] → [0,1]
+    float current = proj.z;                            // глубина пикселя в свете (Vulkan z∈[0,1])
+    if (current > 1.0 || uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
+    return 1.0;                                    // вне frustum света = освещён
+
+    float bias = 0.0015;                               // против self-shadow acne
+    vec2 texel = 1.0 / vec2(textureSize(shadowMap, 0));
+    float lit = 0.0;
+    for (int x = -1; x <= 1; ++x)
+    for (int y = -1; y <= 1; ++y) {
+        float d = texture(shadowMap, uv + vec2(x, y) * texel).r;
+        lit += (current - bias > d) ? 0.0 : 1.0;       // глубже записанного → в тени
+    }
+    return lit / 9.0;                                  // среднее по 3×3 → мягкий край
+}
 
 vec2 dirToUv(vec3 d) {
     return vec2(atan(d.z, d.x) / (2.0 * PI) + 0.5, acos(clamp(d.y, -1.0, 1.0)) / PI);
@@ -86,7 +106,8 @@ void main() {
     vec3 V = normalize(scene.camPos - fragWorldPos);
     vec3 albedoColor = texture(albedo, fragUv).rgb;
 
-    vec3 Lo = shade(normalize(scene.sunDir), scene.sunColor, N, V, albedoColor, roughness, metallic);
+    float shadow = calcShadow(scene.lightVP * vec4(fragWorldPos, 1.0));
+    vec3 Lo = shade(normalize(scene.sunDir), scene.sunColor, N, V, albedoColor, roughness, metallic) * shadow;
 
     vec3 toLight = scene.pointPos - fragWorldPos;
     float dist = length(toLight);

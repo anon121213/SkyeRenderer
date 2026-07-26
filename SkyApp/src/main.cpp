@@ -46,6 +46,7 @@ struct SceneData {
   glm::vec3 pointPos;   float _pad2;
   glm::vec3 pointColor; float _pad3;
   glm::vec3 camPos;     float _pad4;
+  glm::mat4 lightVP;
 };
 
 static void InitImGui(const Window& window, Sky::RHI::Device& device, VkDescriptorPool* imguiPool, ImGui_ImplVulkan_InitInfo* imguiInit)
@@ -157,6 +158,16 @@ int main()
     auto preFragCode = loadSpirv(std::string(SHADER_DIR) + "/prefilter.frag.spv");
     auto preFs = device.createShader({ preFragCode.data(), preFragCode.size() * sizeof(uint32_t) });
 
+    const uint32_t SHADOW_SIZE = 2048;
+    auto shadowMap = device.createTexture({
+      Sky::RHI::Format::D32_SFLOAT, SHADOW_SIZE, SHADOW_SIZE,
+      Sky::RHI::TextureUsage::DepthStencilAttachment | Sky::RHI::TextureUsage::Sampled });
+
+    auto shVertCode = loadSpirv(std::string(SHADER_DIR) + "/shadow.vert.spv");
+    auto shFragCode = loadSpirv(std::string(SHADER_DIR) + "/shadow.frag.spv");
+    auto shVs = device.createShader({ shVertCode.data(), shVertCode.size() * sizeof(uint32_t) });
+    auto shFs = device.createShader({ shFragCode.data(), shFragCode.size() * sizeof(uint32_t) });
+
     auto sampler = device.createSampler({});
 
     // descriptor: env-текстура
@@ -181,6 +192,7 @@ int main()
       { 4, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment }, // irradiance
       { 5, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment }, // prefiltered
       { 6, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment }, // brdfLut
+      { 7, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment },
     };
     auto descLayout = device.createDescriptorSetLayout(layoutDesc);
 
@@ -192,13 +204,14 @@ int main()
     void* sceneMapped = device.mapBuffer(sceneUBO);
 
     auto descSet = device.createDescriptorSet(descLayout);
-    device.updateDescriptorSetTexture(descSet, 0, texture, sampler);
+    device.updateDescriptorSetTexture(descSet, 0, texture,         sampler);
     device.updateDescriptorSetTexture(descSet, 1, textureMetallic, sampler);
-    device.updateDescriptorSetTexture(descSet, 2, textureNormal, sampler);
+    device.updateDescriptorSetTexture(descSet, 2, textureNormal,   sampler);
     device.updateDescriptorSetBuffer(descSet, 3, sceneUBO, sizeof(SceneData));
-    device.updateDescriptorSetTexture(descSet, 4, irradianceMap,  sampler);
-    device.updateDescriptorSetTexture(descSet, 5, prefilteredMap, sampler);
-    device.updateDescriptorSetTexture(descSet, 6, brdfLut,        sampler);
+    device.updateDescriptorSetTexture(descSet, 4, irradianceMap,   sampler);
+    device.updateDescriptorSetTexture(descSet, 5, prefilteredMap,  sampler);
+    device.updateDescriptorSetTexture(descSet, 6, brdfLut,         sampler);
+    device.updateDescriptorSetTexture(descSet, 7, shadowMap,       sampler);
 
     auto vertCode = loadSpirv(std::string(SHADER_DIR) + "/triangle.vert.spv");
     auto fragCode = loadSpirv(std::string(SHADER_DIR) + "/triangle.frag.spv");
@@ -213,6 +226,10 @@ int main()
       { 1, Sky::RHI::Format::RG32_SFLOAT,   offsetof(Vertex, uv)  },     // location 1 = uv
       { 2, Sky::RHI::Format::RGB32_SFLOAT,  offsetof(Vertex, normal) },  // location 2 = normal
       { 3, Sky::RHI::Format::RGBA32_SFLOAT, offsetof(Vertex, tangent) }  // location 3 = tangent
+    };
+
+    const std::vector<Sky::RHI::VertexAttribute> shadowAttrs = {
+      { 0, Sky::RHI::Format::RGB32_SFLOAT, offsetof(Vertex, pos) },   // только позиция
     };
 
     Sky::RHI::GraphicsPipelineDesc pipeDesc{};
@@ -276,6 +293,18 @@ int main()
       device.renderToTexture(prefilteredMap, w, h, prefilterPipeline, skyDescSet,
                              &roughness, sizeof(float), mip);
     }
+
+    Sky::RHI::GraphicsPipelineDesc shadowDesc{};
+    shadowDesc.vertexShader     = shVs;
+    shadowDesc.fragmentShader   = shFs;
+    shadowDesc.vertexStride     = sizeof(Vertex);
+    shadowDesc.vertexAttributes = shadowAttrs;
+    shadowDesc.colorFormat      = Sky::RHI::Format::Undefined;
+    shadowDesc.depthFormat      = Sky::RHI::Format::D32_SFLOAT;
+    shadowDesc.depthTest        = true;
+    shadowDesc.depthWrite       = true;
+    shadowDesc.pushConstantSize = sizeof(glm::mat4);
+    auto shadowPipeline = device.createGraphicsPipeline(shadowDesc);
 
     // --- ImGui init (Vulkan backend via dynamic rendering; GLFW input backend) ---
     VkDescriptorPool imguiPool = VK_NULL_HANDLE;
@@ -349,12 +378,23 @@ int main()
         glm::vec4(0.0f, 0.0f, 3.0f, 0.0f)
       };  // camPos = eye (0,0,3)
 
+      glm::vec3 sunDir   = glm::normalize(glm::vec3(0.5f, 1.0f, 0.3f));   // тот же что sunDir в UBO
+      glm::vec3 lightPos = sunDir * 5.0f;                                 // "камера света" вдоль направления
+      glm::mat4 lightView = glm::lookAt(lightPos, glm::vec3(0.0f), glm::vec3(0, 1, 0));
+      glm::mat4 lightProj = glm::ortho(-2.0f, 2.0f, -2.0f, 2.0f, 0.1f, 10.0f);  // ortho-бокс вокруг модели
+      glm::mat4 lightVP   = lightProj * lightView;
+
+      glm::mat4 lightMVP = lightVP * model;                              // модель в пространстве света
+      device.renderShadowMap(shadowMap, shadowPipeline, vb, ib, indexCount,
+                             SHADOW_SIZE, &lightMVP, sizeof(glm::mat4));
+
       SceneData scene{};
       scene.sunDir     = glm::normalize(glm::vec3(0.5f, 1.0f, 0.3f));
       scene.sunColor   = glm::vec3(sunIntensity);
       scene.pointPos   = glm::vec3(cos(time)*3.0f, 1.5f, sin(time)*3.0f);
       scene.pointColor = glm::vec3(pointIntensity);
       scene.camPos     = glm::vec3(0.0f, 0.0f, 3.0f);
+      scene.lightVP    = lightVP;
       memcpy(sceneMapped, &scene, sizeof(SceneData));
 
       Sky::RHI::FrameGraph fg(device);

@@ -94,6 +94,10 @@ public:
                        PipelineHandle pipeline, DescriptorSetHandle descSet,
                        const void* push, uint32_t push_size, uint32_t mipLevel = 0);
 
+  void renderShadowMap(TextureHandle shadowMap, PipelineHandle pipeline,
+                       BufferHandle vb, BufferHandle ib, uint32_t indexCount,
+                       uint32_t size, const void* push, uint32_t pushSize);
+
   struct Impl;
 
 private:

@@ -77,6 +77,8 @@ set(SHADERS
         ${SHADER_SRC_DIR}/brdf.frag
         ${SHADER_SRC_DIR}/irradiance.frag
         ${SHADER_SRC_DIR}/prefilter.frag
+        ${SHADER_SRC_DIR}/shadow.vert
+        ${SHADER_SRC_DIR}/shadow.frag
 )
 
 set(SPIRV_BINARIES "")

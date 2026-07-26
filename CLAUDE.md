@@ -153,8 +153,19 @@ Sky::RHI::BufferHandle vb = device.createBuffer({...});   // POD, uint64_t
 - App: ImGui_ImplVulkan_Init с `UseDynamicRendering=true` + `PipelineRenderingCreateInfo`. **ImGui 1.91.5 требует свой descriptor pool** (auto-pool `DescriptorPoolSize` появился позже) — создаём в app. Per-frame: NewFrame → UI → после execute: `ImGui::Render()` + `recordOverlay(ImGui_ImplVulkan_RenderDrawData)`. Демо: FPS + слайдеры Sun/Point intensity.
 - Мелочь: дубликат-линк glfw warning (линкуется напрямую + через imgui PUBLIC) — безобиден.
 
-**Phase 7 (Shadows + IBL) — NEXT после ImGui** 🚧
-skybox (equirect HDR) → IBL (irradiance/prefiltered/BRDF LUT, металл отражает окружение) → shadows (shadow map + PCF). Первые compute-пассы здесь.
+**Phase 7 (Shadows + IBL) — DONE ✅ (2026-07-26)**
+- **Shadows** ✅ — shadow map (D32 2048², depth-only пайплайн: colorFormat=Undefined→0 color attachments), `renderShadowMap` рендерит глубину модели глазами света в frame cmd ПЕРЕД основным пассом (обход FG getTexture-заглушки), основной шейдер: light-space lookup + PCF 3×3 + bias. `lightVP` в scene UBO. Тень применяется только к солнцу (point+IBL не затеняются). RHI: createTexture depth-aspect по формату, transitionImageLayout + aspect param.
+  - **Слабые тени = не баг:** IBL заливает затенённую зону (тень гасит только sun), + self-shadowing (нет пола). Усиление: sun-доминантный свет / ground plane / AO на ambient — тюнинг/доп-фичи.
+- **Skybox** ✅ — equirect HDR (venice_sunset_4k.hdr, RGBA32F), fullscreen-triangle пасс, reconstruction луча через inverse(proj·view), рисуется в одном пассе перед моделью (FG всегда CLEAR → 2 пасса в один target нельзя, это Phase 6). depth-флаги пайплайна (depthTest/depthWrite) добавлены для skybox.
+- **IBL** ✅ (split-sum) — три бэйка НА СТАРТЕ (не per-frame FG, env статична):
+  - `renderToTexture` (Device) — bake fullscreen-шейдера в текстуру (+ mipLevel param, per-mip view). Инфра бэйка.
+  - BRDF LUT (RG16F 512²), Irradiance (RGBA16F 64×32, свёртка), Prefiltered (RGBA16F 256×128, 6 мипов, GGX per-roughness).
+  - triangle.frag: diffuse IBL (irradiance×albedo) + specular IBL (prefiltered×(F·brdf.x+brdf.y)), textureLod по roughness. Металл отражает окружение.
+  - Всё 2D equirect (без кубмапов). VulkanImage: mipLevels + createMipView. toVkFormat += RG16/R16_SFLOAT.
+  - **Урок:** GPU command buffer имеет лимит времени (Metal watchdog) — тяжёлый bake (много сэмплов из 4k env) его превышал → device lost. Огрубили сэмплинг (irradiance delta 0.05, prefilter 128 samples).
+- **Осталось: Shadows** — shadow map pass + PCF. (Cascaded — если захочется.)
+
+**НЕ сделано (осознанно):** RGBA16F для env (сейчас RGBA32F 134МБ — работает, но жирно); tone mapping (Phase 8) — яркий HDR может пересвечивать.
 
 **Phase 6 (Frame Graph — Advanced) — после 7**
 transient aliasing, pass culling, **async compute** (много очередей), multi-thread recording. + рефактор FG execute (color/depth special-case → табличный realize()).

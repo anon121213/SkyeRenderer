@@ -25,7 +25,7 @@ void transitionImageLayout(VkCommandBuffer cmd, VkImage image,
                            VkImageLayout oldLayout, VkImageLayout newLayout,
                            VkAccessFlags srcAccess, VkAccessFlags dstAccess,
                            VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage,
-                           uint32_t mipLevel = 0)
+                           uint32_t mipLevel = 0, VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT)
 {
   VkImageMemoryBarrier b{};
   b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -36,7 +36,7 @@ void transitionImageLayout(VkCommandBuffer cmd, VkImage image,
   b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   b.image = image;
-  b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, mipLevel, 1, 0, 1 };
+  b.subresourceRange = { aspect, mipLevel, 1, 0, 1 };
   vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
 
@@ -370,6 +370,49 @@ void Device::Impl::renderToTexture(VulkanImage* target, uint32_t width, uint32_t
   vkDestroyImageView(device.handle(), mipView, nullptr);
 }
 
+void Device::Impl::renderShadowMap(VulkanImage* shadowMap, PipelineHandle pipeline, BufferHandle vb,
+                                   BufferHandle ib, uint32_t indexCount, uint32_t size,
+                                   const void* push, uint32_t pushSize)
+{
+  transitionImageLayout(commandBuffer, shadowMap->handle(),
+    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+    0, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+    0, VK_IMAGE_ASPECT_DEPTH_BIT);
+
+  VkRenderingAttachmentInfo depthAtt{};
+  depthAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+  depthAtt.imageView = shadowMap->view();
+  depthAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+  depthAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  depthAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  depthAtt.clearValue.depthStencil ={ 1.0f, 0 };
+
+  VkRenderingInfo ri{};
+  ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+  ri.renderArea = { {0,0}, {size, size} };
+  ri.layerCount = 1;
+  ri.colorAttachmentCount = 0;
+  ri.pDepthAttachment = &depthAtt;
+
+  vkCmdBeginRenderingKHR(commandBuffer, &ri);
+  CommandList list = createCommandList(commandBuffer);
+  list.bindPipeline(pipeline);
+  if (push) list.pushConstants(push, pushSize);
+  list.bindVertexBuffer(vb);
+  list.bindIndexBuffer(ib, IndexType::UInt32);
+  list.setViewport(0.0f, 0.0f, static_cast<float>(size), static_cast<float>(size));
+  list.setScissor(0, 0, size, size);
+  list.drawIndexed(indexCount);
+  vkCmdEndRenderingKHR(commandBuffer);
+
+  transitionImageLayout(commandBuffer, shadowMap->handle(),
+    VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+    VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+    0, VK_IMAGE_ASPECT_DEPTH_BIT);
+}
+
 void Device::Impl::waitIdle() const
 {
   vkDeviceWaitIdle(device.handle());
@@ -532,11 +575,16 @@ void Device::destroyPipeline(PipelineHandle handle) noexcept
 TextureHandle Device::createTexture(const TextureDesc& desc)
 {
   const VkImageUsageFlags usage = toVkImageUsage(desc.usage) | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  const bool isDepth = desc.format == Format::D32_SFLOAT
+                    || desc.format == Format::D32_SFLOAT_S8_UINT;
+
+  const VkImageAspectFlags aspect = isDepth ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                            : VK_IMAGE_ASPECT_COLOR_BIT;
 
   return m_Impl->texturePool.allocate(std::make_unique<VulkanImage>(
     m_Impl->device.allocator(), m_Impl->device.handle(),
     toVkFormat(desc.format), desc.width, desc.height,
-    usage, VK_IMAGE_ASPECT_COLOR_BIT, desc.mipLevels));
+    usage, aspect, desc.mipLevels));
 }
 
 void Device::destroyTexture(TextureHandle handle) noexcept
@@ -689,6 +737,14 @@ void Device::renderToTexture(TextureHandle target, uint32_t width, uint32_t heig
 {
   VulkanImage* texture = m_Impl->texturePool.resolve(target);
   m_Impl->renderToTexture(texture, width, height, pipeline, descSet, push, push_size, mipLevel);
+}
+
+void Device::renderShadowMap(TextureHandle shadowMap, PipelineHandle pipeline, BufferHandle vb,
+                             BufferHandle ib, uint32_t indexCount, uint32_t size, const void* push,
+                             uint32_t pushSize)
+{
+  auto image = m_Impl->texturePool.resolve(shadowMap);
+  m_Impl->renderShadowMap(image, pipeline, vb, ib, indexCount, size, push, pushSize);
 }
 
 } // namespace Sky::RHI
