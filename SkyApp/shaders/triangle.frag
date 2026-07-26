@@ -93,7 +93,7 @@ vec3 shade(vec3 L, vec3 radiance, vec3 N, vec3 V, vec3 albedo, float roughness, 
 
 void main() {
     vec2 mr = texture(metalRough, fragUv).gb;
-    float roughness = mr.x;
+    float roughness = clamp(mr.x, 0.045, 1.0);
     float metallic = mr.y;
 
     vec3 N = normalize(fragNormal);
@@ -133,6 +133,5 @@ void main() {
 
     vec3 ambient = kD * diffuseIBL + specularIBL;
     vec3 color = Lo + ambient;                                   // direct + IBL
-    outColor = vec4(color, 1.0);
     outColor = vec4(color, 1.0);
 }

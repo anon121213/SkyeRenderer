@@ -79,6 +79,9 @@ set(SHADERS
         ${SHADER_SRC_DIR}/prefilter.frag
         ${SHADER_SRC_DIR}/shadow.vert
         ${SHADER_SRC_DIR}/shadow.frag
+        ${SHADER_SRC_DIR}/tonemap.frag
+        ${SHADER_SRC_DIR}/downsample.frag
+        ${SHADER_SRC_DIR}/upsample.frag
 )
 
 set(SPIRV_BINARIES "")

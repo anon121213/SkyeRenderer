@@ -87,6 +87,7 @@ public:
   [[nodiscard]] DescriptorSetHandle createDescriptorSet(DescriptorSetLayoutHandle layout);
   void destroyDescriptorSet(DescriptorSetHandle handle);
   void updateDescriptorSetTexture(DescriptorSetHandle setHandler, uint32_t binding, TextureHandle textureHandle, SamplerHandle samplerHandle);
+  void updateDescriptorSetTextureMip(DescriptorSetHandle setHandler, uint32_t binding, TextureHandle textureHandle, SamplerHandle samplerHandle, uint32_t mip);
   void updateDescriptorSetBuffer(DescriptorSetHandle setHandler, uint32_t binding, BufferHandle bufferHandle, uint64_t range, uint64_t offset = 0);
   void flushTransfers();
 
@@ -97,6 +98,12 @@ public:
   void renderShadowMap(TextureHandle shadowMap, PipelineHandle pipeline,
                        BufferHandle vb, BufferHandle ib, uint32_t indexCount,
                        uint32_t size, const void* push, uint32_t pushSize);
+
+  void tonemap(PipelineHandle pipeline, DescriptorSetHandle descSet, const void* push, uint32_t size);
+
+  void bloomPass(TextureHandle target, uint32_t width, uint32_t height,
+                PipelineHandle pipeline, DescriptorSetHandle descSet,
+                const void* push, uint32_t pushSize, uint32_t mipLevel, bool additive);
 
   struct Impl;
 

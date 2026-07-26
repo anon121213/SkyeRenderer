@@ -27,8 +27,10 @@ struct GraphicsPipelineDesc
   Format                       depthFormat = Format::Undefined;
   uint32_t                     pushConstantSize = 0;              // bytes of push constant data (0 = none)
   DescriptorSetLayoutHandle descriptorSetLayout;                  // optional — 0 = no descriptors
-  bool depthTest  = true;   // default — как сейчас
-  bool depthWrite = true;
+
+  bool depthTest      = true;
+  bool depthWrite     = true;
+  bool additiveBlend  = false;
 };
 
 }

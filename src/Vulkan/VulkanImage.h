@@ -20,6 +20,7 @@ public:
   [[nodiscard]] uint32_t    mipLevels() const {return m_MipLevels; }
 
   [[nodiscard]] VkImageView createMipView(uint32_t mip) const;
+  [[nodiscard]] VkImageView singleMipView(uint32_t mip);
 
 private:
   VmaAllocator  m_Allocator  = VK_NULL_HANDLE;
@@ -34,4 +35,6 @@ private:
   uint32_t           m_MipLevels = 1;
   VkFormat           m_Format    = VK_FORMAT_UNDEFINED;
   VkImageAspectFlags m_Aspect    = 0;
+
+  std::vector<VkImageView> m_SingleMipViews;
 };

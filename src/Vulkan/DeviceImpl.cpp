@@ -312,7 +312,7 @@ void Device::Impl::flushTransfers()
 
 void Device::Impl::renderToTexture(VulkanImage* target, uint32_t width, uint32_t height,
                                    PipelineHandle pipeline, DescriptorSetHandle descSet,
-                                   const void* push, uint32_t push_size, uint32_t mipLevel)
+                                   const void* push, uint32_t pushSize, uint32_t mipLevel)
 {
   VkCommandBuffer cmd = commandPool.allocatePrimary();
   VkCommandBufferBeginInfo begin{};
@@ -346,7 +346,7 @@ void Device::Impl::renderToTexture(VulkanImage* target, uint32_t width, uint32_t
   CommandList list = createCommandList(cmd);
   list.bindPipeline(pipeline);
   if (descriptorSetPool.resolve(descSet)) list.bindDescriptorSet(descSet);
-  if (push) list.pushConstants(push, push_size);
+  if (push) list.pushConstants(push, pushSize);
   list.setViewport(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height));
   list.setScissor(0, 0, width, height);
   list.draw(3);
@@ -411,6 +411,96 @@ void Device::Impl::renderShadowMap(VulkanImage* shadowMap, PipelineHandle pipeli
     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
     VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
     0, VK_IMAGE_ASPECT_DEPTH_BIT);
+}
+
+void Device::Impl::tonemap(PipelineHandle pipeline, DescriptorSetHandle descSet, const void* push,
+                           uint32_t size)
+{
+  const VkImage     image  = defaultEntry->swapchain.images()[currentImageIndex];
+  const VkImageView view   = defaultEntry->swapchain.imageViews()[currentImageIndex];
+  const VkExtent2D  extent = defaultEntry->swapchain.extent();
+
+  transitionImageLayout(commandBuffer, image,
+    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+  VkRenderingAttachmentInfo att{};
+  att.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+  att.imageView = view;
+  att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  att.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+  VkRenderingInfo ri{};
+  ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+  ri.renderArea = { {0,0}, extent };
+  ri.layerCount = 1;
+  ri.colorAttachmentCount = 1;
+  ri.pColorAttachments = &att;
+
+  vkCmdBeginRenderingKHR(commandBuffer, &ri);
+  CommandList list = createCommandList(commandBuffer);
+  list.bindPipeline(pipeline);
+  list.bindDescriptorSet(descSet);
+  if (push) list.pushConstants(push, size);
+  list.setViewport(0.0f, 0.0f, static_cast<float>(extent.width), static_cast<float>(extent.height));
+  list.setScissor(0.0f, 0.0f, extent.width, extent.height);
+  list.draw(3);
+  vkCmdEndRenderingKHR(commandBuffer);
+
+  transitionImageLayout(commandBuffer, image,
+    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0,
+    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+}
+
+void Device::Impl::bloomPass(VulkanImage* target, uint32_t width, uint32_t height,
+                            PipelineHandle pipeline, DescriptorSetHandle descSet, const void* push,
+                            uint32_t pushSize, uint32_t mipLevel, bool additive)
+{
+  VkImageLayout        oldLayout = additive ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+  VkAccessFlags        srcAccess = additive ? VK_ACCESS_SHADER_READ_BIT : 0;
+  VkAccessFlags        dstAccess = additive ? (VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT)
+                                            : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+  VkPipelineStageFlags srcStage  = additive ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                                            : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+
+  transitionImageLayout(commandBuffer, target->handle(),
+      oldLayout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      srcAccess, dstAccess,
+      srcStage, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, mipLevel);
+
+  VkImageView mipView = target->singleMipView(mipLevel);
+
+  VkRenderingAttachmentInfo att{};
+  att.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+  att.imageView = mipView;
+  att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  att.loadOp = additive ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+  VkRenderingInfo ri{};
+  ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+  ri.renderArea = { {0,0}, {width, height} };
+  ri.layerCount = 1;
+  ri.colorAttachmentCount = 1;
+  ri.pColorAttachments = &att;
+
+  vkCmdBeginRenderingKHR(commandBuffer, &ri);
+  CommandList list = createCommandList(commandBuffer);
+  list.bindPipeline(pipeline);
+  if (descriptorSetPool.resolve(descSet)) list.bindDescriptorSet(descSet);
+  if (push) list.pushConstants(push, pushSize);
+  list.setViewport(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height));
+  list.setScissor(0, 0, width, height);
+  list.draw(3);
+  vkCmdEndRenderingKHR(commandBuffer);
+
+  transitionImageLayout(commandBuffer, target->handle(),
+    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, mipLevel);
 }
 
 void Device::Impl::waitIdle() const
@@ -673,7 +763,7 @@ void Device::destroyDescriptorSet(DescriptorSetHandle handle)
 void Device::updateDescriptorSetTexture(DescriptorSetHandle setHandler, uint32_t binding,
                                         TextureHandle textureHandle, SamplerHandle samplerHandle)
 {
-  VulkanDescriptorSet* set = m_Impl->descriptorSetPool.resolve(setHandler);
+  VulkanDescriptorSet* set     = m_Impl->descriptorSetPool.resolve(setHandler);
   VulkanImage*         tex     = m_Impl->texturePool.resolve(textureHandle);
   VulkanSampler*       sampler = m_Impl->samplerPool.resolve(samplerHandle);
 
@@ -686,6 +776,36 @@ void Device::updateDescriptorSetTexture(DescriptorSetHandle setHandler, uint32_t
   VkDescriptorImageInfo imageInfo{};
   imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   imageInfo.imageView   = tex->view();
+  imageInfo.sampler     = sampler->handle();
+
+  VkWriteDescriptorSet write{};
+  write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+  write.dstSet = set->handle();
+  write.dstBinding = binding;
+  write.descriptorCount = 1;
+  write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  write.pImageInfo = &imageInfo;
+
+  vkUpdateDescriptorSets(m_Impl->device.handle(), 1, &write, 0, nullptr);
+}
+
+void Device::updateDescriptorSetTextureMip(DescriptorSetHandle setHandler, uint32_t binding,
+                                           TextureHandle textureHandle, SamplerHandle samplerHandle,
+                                           uint32_t mip)
+{
+  VulkanDescriptorSet* set     = m_Impl->descriptorSetPool.resolve(setHandler);
+  VulkanImage*         tex     = m_Impl->texturePool.resolve(textureHandle);
+  VulkanSampler*       sampler = m_Impl->samplerPool.resolve(samplerHandle);
+
+  if (!set || !tex || !sampler)
+  {
+    SKY_RHI_ERROR("updateDescriptorSetTextureMip: invalid handle");
+    return;
+  }
+
+  VkDescriptorImageInfo imageInfo{};
+  imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  imageInfo.imageView   = tex->singleMipView(mip);
   imageInfo.sampler     = sampler->handle();
 
   VkWriteDescriptorSet write{};
@@ -745,6 +865,19 @@ void Device::renderShadowMap(TextureHandle shadowMap, PipelineHandle pipeline, B
 {
   auto image = m_Impl->texturePool.resolve(shadowMap);
   m_Impl->renderShadowMap(image, pipeline, vb, ib, indexCount, size, push, pushSize);
+}
+
+void Device::tonemap(PipelineHandle pipeline, DescriptorSetHandle descSet, const void* push, uint32_t size)
+{
+  m_Impl->tonemap(pipeline, descSet, push, size);
+}
+
+void Device::bloomPass(TextureHandle target, uint32_t width, uint32_t height,
+                      PipelineHandle pipeline, DescriptorSetHandle descSet, const void* push,
+                      uint32_t pushSize, uint32_t mipLevel, bool additive)
+{
+  auto image = m_Impl->texturePool.resolve(target);
+  m_Impl->bloomPass(image, width, height, pipeline, descSet, push, pushSize, mipLevel, additive);
 }
 
 } // namespace Sky::RHI

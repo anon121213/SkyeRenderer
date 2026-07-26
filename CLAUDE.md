@@ -144,9 +144,10 @@ Sky::RHI::BufferHandle vb = device.createBuffer({...});   // POD, uint64_t
 - **НЕ реализовано (TODO для dedicated-железа, напр. RTX):** queue ownership transfer transfer→graphics + отдельный transfer command-pool. На MoltenVK не нужно (одно семейство → cmd из graphics-pool submit'ится в тот же family).
 - Streaming manager (политика: что/когда/evict) — **движковое, не RHI** (осознанно отложено). RHI даёт механизм, политику строит consumer.
 
-**ПОРЯДОК (согласовано 2026-07-26): 7 ✅ → 8 → 6 (+frame debugger) → 9 → 10/11 → 12 → 13.**
+**ПОРЯДОК (обновлено 2026-07-26): 7 ✅ → 8 → 6 → FG refactor («адекватный FG») → Frame Debugger → 9 → 10/11 → 12 → 13.**
 - Phase 8 (полишинг: tone map / bloom / TAA / AO) раньше 6 — **быстрее** (~10-15ч ядро) и **видимо** (лечит «сырой» вид, о котором user жаловался).
-- Phase 6 (FG advanced: aliasing/async-compute/MT + **compute-пайплайны которых пока нет**) двигаем к Phase 9 — там 100k объектов дают реальную нагрузку для оптимизатора (на 1 объекте оптимизировать нечего). Frame debugger идёт с Phase 6 (FG знает пассы → auto GPU-timestamp timeline).
+- Phase 6 (FG advanced: aliasing/async-compute/MT + **compute-пайплайны которых пока нет**) двигаем к Phase 9 — там 100k объектов дают реальную нагрузку для оптимизатора (на 1 объекте оптимизировать нечего). Frame Debugger вынесен ПОСЛЕ FG-рефактора (не «с Phase 6») — см. ниже.
+- **FG refactor («адекватный FG») — отдельный шаг между 6 и frame debugger (на практике сросётся с первой половиной блока 6).** Убрать заглушку `getTexture`, loadOp конфигурируемый (LOAD/CLEAR/DONT_CARE), табличный `realize()` вместо special-case color/depth, и **загнать ВСЕ ручные пассы обратно в FG** (shadows, skybox, IBL-бэйки, tonemap, bloom — сейчас пишутся в кадровый cmd в обход FG). Продвинутые фичи Phase 6 (aliasing/async-compute/MT) требуют адекватного FG как фундамента.
 
 **ImGui интеграция — DONE ✅ (2026-07-26)** — фундамент debug-UI (твики Phase 7, frame debugger позже).
 - ImGui 1.91.5 через FetchContent (нет CMakeLists → static lib target `imgui` из core + imgui_impl_glfw + imgui_impl_vulkan). `IMGUI_IMPL_VULKAN_USE_VOLK` (мы на volk).
@@ -172,7 +173,7 @@ Sky::RHI::BufferHandle vb = device.createBuffer({...});   // POD, uint64_t
 **Phase 6 (Frame Graph — Advanced) — после 7**
 transient aliasing, pass culling, **async compute** (много очередей), multi-thread recording. + рефактор FG execute (color/depth special-case → табличный realize()).
 
-**Frame Debugger — после Phase 6** (идея пользователя, отличная). Т.к. FG знает пассы по именам → auto-обёртка каждого в GPU timestamp queries (VkQueryPool) + **timeline-визуализация** (Gantt: пасс = полоска, позиция = старт на GPU, ширина = длительность; много дорожек с async compute). Окупается до RTX (Phase 10-11). Не «циферки», а полноценный GPU timeline profiler (уровень UE GPU Visualizer / RenderDoc timeline).
+**Frame Debugger — ПОСЛЕ FG-рефактора (последним в блоке 6)** (идея пользователя, отличная). **Почему последним:** дебагер авто-инструментирует пассы FG (обёртка каждого по имени в GPU timestamp queries). Пока половина пассов идёт мимо FG (shadows/skybox/IBL/tonemap/bloom) — дебагер видел бы только часть кадра. Строим его, когда FG — единственный оркестратор. Т.к. FG знает пассы по именам → auto-обёртка каждого в GPU timestamp queries (VkQueryPool) + **timeline-визуализация** (Gantt: пасс = полоска, позиция = старт на GPU, ширина = длительность; много дорожек с async compute). Окупается до RTX (Phase 10-11). Не «циферки», а полноценный GPU timeline profiler (уровень UE GPU Visualizer / RenderDoc timeline).
 
 **Отложено осознанно (не хаки):**
 - **Skybox → перенесён в Phase 7** — неотделим от IBL; HDR equirect грузится один раз для неба + IBL (irradiance/prefiltered). Отдельный skybox без IBL = чистая косметика.

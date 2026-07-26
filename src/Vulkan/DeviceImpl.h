@@ -115,11 +115,17 @@ struct Device::Impl
 
   void renderToTexture(VulkanImage* target, uint32_t width, uint32_t height,
                        PipelineHandle pipeline, DescriptorSetHandle descSet,
-                       const void* push, uint32_t push_size, uint32_t mipLevel = 0);
+                       const void* push, uint32_t pushSize, uint32_t mipLevel = 0);
 
   void renderShadowMap(VulkanImage* shadowMap, PipelineHandle pipeline,
                        BufferHandle vb, BufferHandle ib, uint32_t indexCount,
                        uint32_t size, const void* push, uint32_t pushSize);
+
+  void tonemap(PipelineHandle pipeline, DescriptorSetHandle descSet, const void* push, uint32_t size);
+
+  void bloomPass(VulkanImage* target, uint32_t width, uint32_t height,
+                PipelineHandle pipeline, DescriptorSetHandle descSet,
+                const void* push, uint32_t pushSize, uint32_t mipLevel, bool additive);
 
   explicit Impl(const DeviceCreateInfo& info);
   ~Impl();

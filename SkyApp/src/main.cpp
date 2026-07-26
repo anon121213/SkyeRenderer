@@ -29,18 +29,42 @@ static std::vector<uint32_t> loadSpirv(const std::string& path)
   return buffer;
 }
 
-struct PushConstants
+// ============================================================================
+// Push-constant / UBO layouts (must match GLSL)
+// ============================================================================
+
+struct PushConstants          // model: MVP + model matrix
 {
   glm::mat4 mvp;
   glm::mat4 model;
 };
 
-struct SkyPush {
+struct SkyPush                // skybox: ray reconstruction + camera
+{
   glm::mat4 invViewProj;
   glm::vec4 camPos;
 };
 
-struct SceneData {
+struct BloomPush              // bloom downsample: source texel size + threshold
+{
+  glm::vec2 texelSize;
+  float     threshold;
+  int       isFirstPass;
+};
+
+struct TonemapPush            // tonemap: exposure + bloom mix strength
+{
+  float exposure;
+  float bloomIntensity;
+};
+
+struct UpsamplePush
+{
+  glm::vec2 filterRadius;
+};
+
+struct SceneData             // per-frame scene UBO (std140: vec3 padded to 16)
+{
   glm::vec3 sunDir;     float _pad0;
   glm::vec3 sunColor;   float _pad1;
   glm::vec3 pointPos;   float _pad2;
@@ -93,6 +117,9 @@ int main()
 
   try
   {
+    // ========================================================================
+    // Window, Device, Swapchain
+    // ========================================================================
     const Window window(1920, 1080, "Vulkan test window");
     const auto extensions = Window::getRequiredInstanceExtensions();
 
@@ -109,7 +136,12 @@ int main()
 
     Sky::RHI::Device device(info);
 
-    // --- load a real PBR model (mesh + material maps) from glTF ---
+    const auto sw       = device.defaultSwapchain();
+    const auto scExtent = device.swapchainExtent(sw);
+
+    // ========================================================================
+    // Assets: glTF model + HDR environment
+    // ========================================================================
     GltfModel model = loadGltf(std::string(ASSET_DIR) + "/DamagedHelmet.glb");
     SKY_RHI_INFO("Loaded glTF: {} verts, {} indices, albedo {}x{}",
                  model.vertices.size(), model.indices.size(), model.albedo.width, model.albedo.height);
@@ -129,60 +161,88 @@ int main()
 
     auto envTex = device.createTexture({
       .format = Sky::RHI::Format::RGBA32_SFLOAT,
-      .width = env.width,
+      .width  = env.width,
       .height = env.height,
-      .usage = Sky::RHI::TextureUsage::Sampled,
+      .usage  = Sky::RHI::TextureUsage::Sampled,
     });
     device.uploadTextureData(envTex, env.pixels.data(), env.pixels.size() * sizeof(float));
 
-    auto brdfLut = device.createTexture({
-    Sky::RHI::Format::RG16_SFLOAT, 512, 512,
-    Sky::RHI::TextureUsage::ColorAttachment | Sky::RHI::TextureUsage::Sampled });
+    // ========================================================================
+    // Shader modules
+    // ========================================================================
+    auto makeShader = [&](const char* name) {
+      auto code = loadSpirv(std::string(SHADER_DIR) + name);
+      return device.createShader({ code.data(), code.size() * sizeof(uint32_t) });
+    };
 
-    auto brdfFragCode = loadSpirv(std::string(SHADER_DIR) + "/brdf.frag.spv");
-    auto brdfFs = device.createShader({ brdfFragCode.data(), brdfFragCode.size() * sizeof(uint32_t) });
+    auto vs     = makeShader("/triangle.vert.spv");     // model
+    auto fs     = makeShader("/triangle.frag.spv");
+    auto skyVs  = makeShader("/skybox.vert.spv");       // fullscreen triangle (reused by all post passes)
+    auto skyFs  = makeShader("/skybox.frag.spv");
+    auto brdfFs = makeShader("/brdf.frag.spv");         // IBL: BRDF LUT bake
+    auto irrFs  = makeShader("/irradiance.frag.spv");   // IBL: irradiance bake
+    auto preFs  = makeShader("/prefilter.frag.spv");    // IBL: prefiltered env bake
+    auto shVs   = makeShader("/shadow.vert.spv");       // shadow depth pass
+    auto shFs   = makeShader("/shadow.frag.spv");
+    auto tmFs   = makeShader("/tonemap.frag.spv");      // post: tonemap + bloom composite
+    auto dsFs   = makeShader("/downsample.frag.spv");   // post: bloom downsample/prefilter
+    auto usFs   = makeShader("/upsample.frag.spv");     // post: bloom uspsample
+
+    // ========================================================================
+    // Samplers
+    // ========================================================================
+    auto sampler      = device.createSampler({});                                          // default: linear, repeat
+    auto bloomSampler = device.createSampler({ .addressMode = Sky::RHI::AddressMode::ClampToEdge });
+
+    // ========================================================================
+    // Render targets & GPU textures
+    // ========================================================================
+    // HDR scene target (scene renders here, then tonemap -> swapchain)
+    auto hdrTarget = device.createTexture({
+      Sky::RHI::Format::RGBA16_SFLOAT, scExtent.width, scExtent.height,
+      Sky::RHI::TextureUsage::ColorAttachment | Sky::RHI::TextureUsage::Sampled });
+
+    // Bloom mip chain: base = half-res, halved down to ~8px, capped at 7 levels
+    uint32_t bloomMipCount = 1;
+    {
+      uint32_t bw = scExtent.width / 2, bh = scExtent.height / 2;
+      while (glm::min(bw, bh) > 8 && bloomMipCount < 7) { bw /= 2; bh /= 2; bloomMipCount++; }
+    }
+    auto bloomTarget = device.createTexture({
+      Sky::RHI::Format::RGBA16_SFLOAT, scExtent.width / 2, scExtent.height / 2,
+      Sky::RHI::TextureUsage::ColorAttachment | Sky::RHI::TextureUsage::Sampled, bloomMipCount });
+
+    // IBL bakes (filled once at startup, below)
+    auto brdfLut = device.createTexture({
+      Sky::RHI::Format::RG16_SFLOAT, 512, 512,
+      Sky::RHI::TextureUsage::ColorAttachment | Sky::RHI::TextureUsage::Sampled });
 
     auto irradianceMap = device.createTexture({
-    Sky::RHI::Format::RGBA16_SFLOAT, 64, 32,
-    Sky::RHI::TextureUsage::ColorAttachment | Sky::RHI::TextureUsage::Sampled });
-
-    auto irrFragCode = loadSpirv(std::string(SHADER_DIR) + "/irradiance.frag.spv");
-    auto irrFs = device.createShader({ irrFragCode.data(), irrFragCode.size() * sizeof(uint32_t) });
+      Sky::RHI::Format::RGBA16_SFLOAT, 64, 32,
+      Sky::RHI::TextureUsage::ColorAttachment | Sky::RHI::TextureUsage::Sampled });
 
     const uint32_t PREFILTER_MIPS = 6;
     auto prefilteredMap = device.createTexture({
       Sky::RHI::Format::RGBA16_SFLOAT, 256, 128,
       Sky::RHI::TextureUsage::ColorAttachment | Sky::RHI::TextureUsage::Sampled,
-      PREFILTER_MIPS });                            // ← mipLevels
-
-    auto preFragCode = loadSpirv(std::string(SHADER_DIR) + "/prefilter.frag.spv");
-    auto preFs = device.createShader({ preFragCode.data(), preFragCode.size() * sizeof(uint32_t) });
+      PREFILTER_MIPS });
 
     const uint32_t SHADOW_SIZE = 2048;
     auto shadowMap = device.createTexture({
       Sky::RHI::Format::D32_SFLOAT, SHADOW_SIZE, SHADOW_SIZE,
       Sky::RHI::TextureUsage::DepthStencilAttachment | Sky::RHI::TextureUsage::Sampled });
 
-    auto shVertCode = loadSpirv(std::string(SHADER_DIR) + "/shadow.vert.spv");
-    auto shFragCode = loadSpirv(std::string(SHADER_DIR) + "/shadow.frag.spv");
-    auto shVs = device.createShader({ shVertCode.data(), shVertCode.size() * sizeof(uint32_t) });
-    auto shFs = device.createShader({ shFragCode.data(), shFragCode.size() * sizeof(uint32_t) });
-
-    auto sampler = device.createSampler({});
-
-    // descriptor: env-текстура
+    // ========================================================================
+    // Descriptor layouts & sets
+    // ========================================================================
+    // --- environment (skybox + IBL bakes) ---
     Sky::RHI::DescriptorSetLayoutDesc skyLayoutDesc{};
     skyLayoutDesc.bindings = { { 0, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment } };
     auto skyLayout  = device.createDescriptorSetLayout(skyLayoutDesc);
     auto skyDescSet = device.createDescriptorSet(skyLayout);
-    device.updateDescriptorSetTexture(skyDescSet, 0, envTex, sampler);   // переиспользуем sampler
+    device.updateDescriptorSetTexture(skyDescSet, 0, envTex, sampler);
 
-    // shaders
-    auto skyVertCode = loadSpirv(std::string(SHADER_DIR) + "/skybox.vert.spv");
-    auto skyFragCode = loadSpirv(std::string(SHADER_DIR) + "/skybox.frag.spv");
-    auto skyVs = device.createShader({ skyVertCode.data(), skyVertCode.size() * sizeof(uint32_t) });
-    auto skyFs = device.createShader({ skyFragCode.data(), skyFragCode.size() * sizeof(uint32_t) });
-
+    // --- model (PBR): 3 material maps + scene UBO + 3 IBL maps + shadow ---
     Sky::RHI::DescriptorSetLayoutDesc layoutDesc{};
     layoutDesc.bindings = {
       { 0, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment }, // albedo
@@ -192,35 +252,54 @@ int main()
       { 4, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment }, // irradiance
       { 5, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment }, // prefiltered
       { 6, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment }, // brdfLut
-      { 7, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment },
+      { 7, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment }, // shadowMap
     };
     auto descLayout = device.createDescriptorSetLayout(layoutDesc);
 
     const auto sceneUBO = device.createBuffer({
       sizeof(SceneData),
       Sky::RHI::BufferUsage::Uniform,
-      Sky::RHI::MemoryType::CpuToGpu});
-
+      Sky::RHI::MemoryType::CpuToGpu });
     void* sceneMapped = device.mapBuffer(sceneUBO);
 
     auto descSet = device.createDescriptorSet(descLayout);
     device.updateDescriptorSetTexture(descSet, 0, texture,         sampler);
     device.updateDescriptorSetTexture(descSet, 1, textureMetallic, sampler);
     device.updateDescriptorSetTexture(descSet, 2, textureNormal,   sampler);
-    device.updateDescriptorSetBuffer(descSet, 3, sceneUBO, sizeof(SceneData));
+    device.updateDescriptorSetBuffer (descSet, 3, sceneUBO, sizeof(SceneData));
     device.updateDescriptorSetTexture(descSet, 4, irradianceMap,   sampler);
     device.updateDescriptorSetTexture(descSet, 5, prefilteredMap,  sampler);
     device.updateDescriptorSetTexture(descSet, 6, brdfLut,         sampler);
     device.updateDescriptorSetTexture(descSet, 7, shadowMap,       sampler);
 
-    auto vertCode = loadSpirv(std::string(SHADER_DIR) + "/triangle.vert.spv");
-    auto fragCode = loadSpirv(std::string(SHADER_DIR) + "/triangle.frag.spv");
+    // --- tonemap: hdr (binding 0) + bloom mip0 (binding 1) ---
+    Sky::RHI::DescriptorSetLayoutDesc tmLayoutDesc{};
+    tmLayoutDesc.bindings = {
+      { 0, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment },
+      { 1, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment },
+    };
+    auto tmLayout  = device.createDescriptorSetLayout(tmLayoutDesc);
+    auto tmDescSet = device.createDescriptorSet(tmLayout);
+    device.updateDescriptorSetTexture   (tmDescSet, 0, hdrTarget,   sampler);
+    device.updateDescriptorSetTextureMip(tmDescSet, 1, bloomTarget, bloomSampler, 0);
 
-    auto vs = device.createShader({ vertCode.data(), vertCode.size() * sizeof(uint32_t) });
-    auto fs = device.createShader({ fragCode.data(), fragCode.size() * sizeof(uint32_t) });
+    // --- bloom: source texture the downsample pass samples ---
+    Sky::RHI::DescriptorSetLayoutDesc bloomLayoutDesc{};
+    bloomLayoutDesc.bindings = { { 0, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment } };
+    auto bloomLayout  = device.createDescriptorSetLayout(bloomLayoutDesc);
+    auto bloomDescSet = device.createDescriptorSet(bloomLayout);
+    device.updateDescriptorSetTexture(bloomDescSet, 0, hdrTarget, bloomSampler);   // first pass source = HDR
 
-    const auto sw = device.defaultSwapchain();
+    // one descriptor per bloom mip — samples that mip (source for down/up passes)
+    std::vector<Sky::RHI::DescriptorSetHandle> bloomMipSets(bloomMipCount);
+    for (uint32_t k = 0; k < bloomMipCount; ++k) {
+      bloomMipSets[k] = device.createDescriptorSet(bloomLayout);
+      device.updateDescriptorSetTextureMip(bloomMipSets[k], 0, bloomTarget, bloomSampler, k);
+    }
 
+    // ========================================================================
+    // Vertex layouts
+    // ========================================================================
     const std::vector<Sky::RHI::VertexAttribute> attrs = {
       { 0, Sky::RHI::Format::RGB32_SFLOAT,  offsetof(Vertex, pos) },     // location 0 = pos
       { 1, Sky::RHI::Format::RG32_SFLOAT,   offsetof(Vertex, uv)  },     // location 1 = uv
@@ -229,32 +308,38 @@ int main()
     };
 
     const std::vector<Sky::RHI::VertexAttribute> shadowAttrs = {
-      { 0, Sky::RHI::Format::RGB32_SFLOAT, offsetof(Vertex, pos) },   // только позиция
+      { 0, Sky::RHI::Format::RGB32_SFLOAT, offsetof(Vertex, pos) },   // position only
     };
 
+    // ========================================================================
+    // Pipelines
+    // ========================================================================
+    // model (PBR) — renders into the HDR target
     Sky::RHI::GraphicsPipelineDesc pipeDesc{};
     pipeDesc.vertexShader        = vs;
     pipeDesc.fragmentShader      = fs;
     pipeDesc.vertexStride        = sizeof(Vertex);
     pipeDesc.vertexAttributes    = attrs;
-    pipeDesc.colorFormat         = device.swapchainFormat(sw);  // matching swapchain format
+    pipeDesc.colorFormat         = Sky::RHI::Format::RGBA16_SFLOAT;
     pipeDesc.depthFormat         = Sky::RHI::Format::D32_SFLOAT;
     pipeDesc.pushConstantSize    = sizeof(PushConstants);
     pipeDesc.descriptorSetLayout = descLayout;
     const auto pipeline = device.createGraphicsPipeline(pipeDesc);
 
+    // skybox — background, no depth
     Sky::RHI::GraphicsPipelineDesc skyDesc{};
     skyDesc.vertexShader        = skyVs;
     skyDesc.fragmentShader      = skyFs;
     skyDesc.vertexStride        = 0;
-    skyDesc.colorFormat         = device.swapchainFormat(sw);
-    skyDesc.depthFormat         = Sky::RHI::Format::D32_SFLOAT;   // match the pass's depth attachment
+    skyDesc.colorFormat         = Sky::RHI::Format::RGBA16_SFLOAT;
+    skyDesc.depthFormat         = Sky::RHI::Format::D32_SFLOAT;
     skyDesc.pushConstantSize    = sizeof(SkyPush);
     skyDesc.descriptorSetLayout = skyLayout;
     skyDesc.depthTest           = false;
     skyDesc.depthWrite          = false;
     auto skyPipeline = device.createGraphicsPipeline(skyDesc);
 
+    // IBL: BRDF LUT bake
     Sky::RHI::GraphicsPipelineDesc brdfDesc{};
     brdfDesc.vertexShader   = skyVs;
     brdfDesc.fragmentShader = brdfFs;
@@ -263,8 +348,7 @@ int main()
     brdfDesc.depthFormat    = Sky::RHI::Format::Undefined;
     auto brdfPipeline = device.createGraphicsPipeline(brdfDesc);
 
-    device.renderToTexture(brdfLut, 512, 512, brdfPipeline, {}, nullptr, 0);
-
+    // IBL: irradiance bake
     Sky::RHI::GraphicsPipelineDesc irrDesc{};
     irrDesc.vertexShader        = skyVs;
     irrDesc.fragmentShader      = irrFs;
@@ -274,26 +358,18 @@ int main()
     irrDesc.descriptorSetLayout = skyLayout;
     auto irrPipeline = device.createGraphicsPipeline(irrDesc);
 
-    device.renderToTexture(irradianceMap, 64, 32, irrPipeline, skyDescSet, nullptr, 0);
-
+    // IBL: prefiltered env bake (per-roughness mip)
     Sky::RHI::GraphicsPipelineDesc preDesc{};
     preDesc.vertexShader        = skyVs;
     preDesc.fragmentShader      = preFs;
     preDesc.vertexStride        = 0;
     preDesc.colorFormat         = Sky::RHI::Format::RGBA16_SFLOAT;
     preDesc.depthFormat         = Sky::RHI::Format::Undefined;
-    preDesc.descriptorSetLayout = skyLayout;                     // env на set0 binding0
+    preDesc.descriptorSetLayout = skyLayout;                     // env on set0 binding0
     preDesc.pushConstantSize    = sizeof(float);                 // roughness
     auto prefilterPipeline = device.createGraphicsPipeline(preDesc);
 
-    for (uint32_t mip = 0; mip < PREFILTER_MIPS; ++mip) {
-      uint32_t w = 256u >> mip;
-      uint32_t h = 128u >> mip;
-      float roughness = float(mip) / float(PREFILTER_MIPS - 1);
-      device.renderToTexture(prefilteredMap, w, h, prefilterPipeline, skyDescSet,
-                             &roughness, sizeof(float), mip);
-    }
-
+    // shadow — depth-only (no color attachment)
     Sky::RHI::GraphicsPipelineDesc shadowDesc{};
     shadowDesc.vertexShader     = shVs;
     shadowDesc.fragmentShader   = shFs;
@@ -306,14 +382,55 @@ int main()
     shadowDesc.pushConstantSize = sizeof(glm::mat4);
     auto shadowPipeline = device.createGraphicsPipeline(shadowDesc);
 
-    // --- ImGui init (Vulkan backend via dynamic rendering; GLFW input backend) ---
-    VkDescriptorPool imguiPool = VK_NULL_HANDLE;
-    ImGui_ImplVulkan_InitInfo imguiInfo{};
-    InitImGui(window, device, &imguiPool, &imguiInfo);
+    // bloom downsample/prefilter
+    Sky::RHI::GraphicsPipelineDesc dsDesc{};
+    dsDesc.vertexShader        = skyVs;
+    dsDesc.fragmentShader      = dsFs;
+    dsDesc.vertexStride        = 0;
+    dsDesc.colorFormat         = Sky::RHI::Format::RGBA16_SFLOAT;
+    dsDesc.depthFormat         = Sky::RHI::Format::Undefined;
+    dsDesc.descriptorSetLayout = bloomLayout;
+    dsDesc.pushConstantSize    = sizeof(BloomPush);
+    auto downsamplePipeline = device.createGraphicsPipeline(dsDesc);
 
-    float sunIntensity   = 2.0f;
-    float pointIntensity = 8.0f;
+    // tonemap — HDR + bloom -> swapchain
+    Sky::RHI::GraphicsPipelineDesc tmDesc{};
+    tmDesc.vertexShader        = skyVs;
+    tmDesc.fragmentShader      = tmFs;
+    tmDesc.vertexStride        = 0;
+    tmDesc.colorFormat         = device.swapchainFormat(sw);
+    tmDesc.depthFormat         = Sky::RHI::Format::Undefined;
+    tmDesc.descriptorSetLayout = tmLayout;
+    tmDesc.pushConstantSize    = sizeof(TonemapPush);
+    auto tonemapPipeline = device.createGraphicsPipeline(tmDesc);
 
+    Sky::RHI::GraphicsPipelineDesc usDesc{};
+    usDesc.vertexShader        = skyVs;
+    usDesc.fragmentShader      = usFs;
+    usDesc.vertexStride        = 0;
+    usDesc.colorFormat         = Sky::RHI::Format::RGBA16_SFLOAT;
+    usDesc.depthFormat         = Sky::RHI::Format::Undefined;
+    usDesc.descriptorSetLayout = bloomLayout;
+    usDesc.pushConstantSize    = sizeof(UpsamplePush);
+    usDesc.additiveBlend       = true;
+    auto upsamplePipeline = device.createGraphicsPipeline(usDesc);
+
+    // ========================================================================
+    // IBL bakes (one-time, env is static)
+    // ========================================================================
+    device.renderToTexture(brdfLut, 512, 512, brdfPipeline, {}, nullptr, 0);
+    device.renderToTexture(irradianceMap, 64, 32, irrPipeline, skyDescSet, nullptr, 0);
+    for (uint32_t mip = 0; mip < PREFILTER_MIPS; ++mip) {
+      uint32_t w = 256u >> mip;
+      uint32_t h = 128u >> mip;
+      float roughness = float(mip) / float(PREFILTER_MIPS - 1);
+      device.renderToTexture(prefilteredMap, w, h, prefilterPipeline, skyDescSet,
+                             &roughness, sizeof(float), mip);
+    }
+
+    // ========================================================================
+    // GPU geometry buffers
+    // ========================================================================
     const auto vb = device.createBuffer({
        model.vertices.size() * sizeof(Vertex),
        Sky::RHI::BufferUsage::Vertex | Sky::RHI::BufferUsage::TransferDst,
@@ -328,18 +445,37 @@ int main()
 
     const uint32_t indexCount = static_cast<uint32_t>(model.indices.size());
 
+    // ========================================================================
+    // ImGui
+    // ========================================================================
+    VkDescriptorPool imguiPool = VK_NULL_HANDLE;
+    ImGui_ImplVulkan_InitInfo imguiInfo{};
+    InitImGui(window, device, &imguiPool, &imguiInfo);
+
+    // ========================================================================
+    // Tweakables (ImGui-controlled)
+    // ========================================================================
+    float sunIntensity   = 2.0f;
+    float pointIntensity = 8.0f;
+    float exposure       = 1.0f;
+    float bloomIntensity = 0.05f;
+
     struct TriData
     {
       Sky::RHI::FGResource backbuffer;
       Sky::RHI::FGResource depth;
     };
 
+    // ========================================================================
+    // Render loop
+    // ========================================================================
     while (!window.shouldClose())
     {
       Window::pollEvents();
 
       device.beginFrame();
 
+      // --- ImGui UI ---
       ImGui_ImplVulkan_NewFrame();
       ImGui_ImplGlfw_NewFrame();
       ImGui::NewFrame();
@@ -347,10 +483,13 @@ int main()
       ImGui::Text("%.1f FPS (%.2f ms)", ImGui::GetIO().Framerate, 1000.0f / ImGui::GetIO().Framerate);
       ImGui::SliderFloat("Sun intensity",   &sunIntensity,   0.0f, 10.0f);
       ImGui::SliderFloat("Point intensity", &pointIntensity, 0.0f, 20.0f);
+      ImGui::SliderFloat("Exposure",        &exposure,       0.0f, 5.0f);
+      ImGui::SliderFloat("Bloom intensity", &bloomIntensity, 0.0f, 1.0f);
       ImGui::End();
 
       const auto extent = device.swapchainExtent(sw);
 
+      // --- camera / transforms ---
       const float time   = static_cast<float>(glfwGetTime());
       const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
 
@@ -365,29 +504,22 @@ int main()
       proj[1][1] *= -1.0f;
 
       glm::mat4 invViewProj = glm::inverse(proj * view);
+      glm::mat4 mvp         = proj * view * model;
 
-      glm::mat4 mvp = proj * view * model;
+      PushConstants pushConstants = { .mvp = mvp, .model = model };
+      SkyPush skyPush{ invViewProj, glm::vec4(0.0f, 0.0f, 3.0f, 0.0f) };   // camPos = eye (0,0,3)
 
-      PushConstants pushConstants = {
-        .mvp = mvp,
-        .model = model,
-      };
-
-      SkyPush skyPush{
-        invViewProj,
-        glm::vec4(0.0f, 0.0f, 3.0f, 0.0f)
-      };  // camPos = eye (0,0,3)
-
-      glm::vec3 sunDir   = glm::normalize(glm::vec3(0.5f, 1.0f, 0.3f));   // тот же что sunDir в UBO
-      glm::vec3 lightPos = sunDir * 5.0f;                                 // "камера света" вдоль направления
+      // --- shadow pass (light's view of the model) ---
+      glm::vec3 sunDir    = glm::normalize(glm::vec3(0.5f, 1.0f, 0.3f));    // matches sunDir in UBO
+      glm::vec3 lightPos  = sunDir * 5.0f;                                  // "light camera" along the direction
       glm::mat4 lightView = glm::lookAt(lightPos, glm::vec3(0.0f), glm::vec3(0, 1, 0));
-      glm::mat4 lightProj = glm::ortho(-2.0f, 2.0f, -2.0f, 2.0f, 0.1f, 10.0f);  // ortho-бокс вокруг модели
+      glm::mat4 lightProj = glm::ortho(-2.0f, 2.0f, -2.0f, 2.0f, 0.1f, 10.0f);  // ortho box around the model
       glm::mat4 lightVP   = lightProj * lightView;
-
-      glm::mat4 lightMVP = lightVP * model;                              // модель в пространстве света
+      glm::mat4 lightMVP  = lightVP * model;
       device.renderShadowMap(shadowMap, shadowPipeline, vb, ib, indexCount,
                              SHADOW_SIZE, &lightMVP, sizeof(glm::mat4));
 
+      // --- scene UBO ---
       SceneData scene{};
       scene.sunDir     = glm::normalize(glm::vec3(0.5f, 1.0f, 0.3f));
       scene.sunColor   = glm::vec3(sunIntensity);
@@ -397,10 +529,11 @@ int main()
       scene.lightVP    = lightVP;
       memcpy(sceneMapped, &scene, sizeof(SceneData));
 
+      // --- main scene pass (skybox + model) into the HDR target ---
       Sky::RHI::FrameGraph fg(device);
       fg.addRasterPass<TriData>("Triangle",
         [&](Sky::RHI::PassBuilder& b, TriData& d) {
-          d.backbuffer = b.writeColor(b.importSwapchain(sw));
+          d.backbuffer = b.writeColor(b.importColorTarget(hdrTarget));
           d.depth = b.writeDepth(b.createTexture("deph",
             { Sky::RHI::Format::D32_SFLOAT, extent.width, extent.height}));
         },
@@ -427,6 +560,42 @@ int main()
       fg.compile();
       device.execute(fg);
 
+      // --- bloom: prefilter HDR -> bloom mip0 (stage A: single pass) ---
+      BloomPush bp{};
+      bp.texelSize   = glm::vec2(1.0f / scExtent.width, 1.0f / scExtent.height);
+      bp.threshold   = 1.0f;
+      bp.isFirstPass = 1;
+      device.bloomPass(bloomTarget, scExtent.width / 2, scExtent.height / 2,
+                       downsamplePipeline, bloomDescSet, &bp, sizeof(BloomPush), 0, false);
+
+      for (uint32_t i = 0; i < bloomMipCount - 1; i++)
+      {
+        uint32_t dstW = std::max(1u, (scExtent.width  / 2) >> (i + 1));
+        uint32_t dstH = std::max(1u, (scExtent.height / 2) >> (i + 1));
+
+        bp.texelSize   = glm::vec2(1.0 / ((scExtent.width/2) >> i), 1.0 / ((scExtent.height/2) >> i));
+        bp.threshold   = 1.0f;
+        bp.isFirstPass = 0;
+        device.bloomPass(bloomTarget, dstW, dstH, downsamplePipeline, bloomMipSets[i],
+                         &bp, sizeof(BloomPush), i + 1, false);
+      }
+
+      UpsamplePush up{};
+      up.filterRadius = glm::vec2(0.005f);
+
+      for (uint32_t i = bloomMipCount - 1; i > 0; i--)
+      {
+        uint32_t dstW = std::max(1u, (scExtent.width  / 2) >> (i - 1));
+        uint32_t dstH = std::max(1u, (scExtent.height / 2) >> (i - 1));
+        device.bloomPass(bloomTarget, dstW, dstH, upsamplePipeline, bloomMipSets[i],
+                         &up, sizeof(UpsamplePush), i - 1, true);
+      }
+
+      // --- tonemap: HDR + bloom -> swapchain ---
+      TonemapPush tmp{ exposure, bloomIntensity };
+      device.tonemap(tonemapPipeline, tmDescSet, &tmp, sizeof(TonemapPush));
+
+      // --- ImGui overlay ---
       ImGui::Render();
       device.recordOverlay([](void* cmd) {
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), static_cast<VkCommandBuffer>(cmd));
@@ -437,6 +606,9 @@ int main()
 
     device.waitIdle();
 
+    // ========================================================================
+    // Cleanup
+    // ========================================================================
     ImGui_ImplVulkan_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
@@ -444,7 +616,6 @@ int main()
 
     device.unmapBuffer(sceneUBO);
     device.destroyBuffer(sceneUBO);
-
     device.destroyBuffer(ib);
     device.destroyBuffer(vb);
   }
