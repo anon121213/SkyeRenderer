@@ -35,6 +35,11 @@ struct PushConstants
   glm::mat4 model;
 };
 
+struct SkyPush {
+  glm::mat4 invViewProj;
+  glm::vec4 camPos;
+};
+
 struct SceneData {
   glm::vec3 sunDir;     float _pad0;
   glm::vec3 sunColor;   float _pad1;
@@ -108,6 +113,9 @@ int main()
     SKY_RHI_INFO("Loaded glTF: {} verts, {} indices, albedo {}x{}",
                  model.vertices.size(), model.indices.size(), model.albedo.width, model.albedo.height);
 
+    HdrImage env = loadHdr(std::string(ASSET_DIR) + "/venice_sunset_4k.hdr");
+    SKY_RHI_INFO("Loaded HDR: {}x{}", env.width, env.height);
+
     auto makeTexture = [&](const ImageData& img) {
       auto tex = device.createTexture({ Sky::RHI::Format::RGBA8_UNORM, img.width, img.height, Sky::RHI::TextureUsage::Sampled });
       device.uploadTextureData(tex, img.pixels.data(), img.pixels.size());
@@ -117,8 +125,28 @@ int main()
     auto texture         = makeTexture(model.albedo);      // baseColor
     auto textureMetallic = makeTexture(model.metalRough);  // G=roughness, B=metallic
     auto textureNormal   = makeTexture(model.normal);      // tangent-space normals
+    auto envTex = device.createTexture({
+      .format = Sky::RHI::Format::RGBA32_SFLOAT,
+      .width = env.width,
+      .height = env.height,
+      .usage = Sky::RHI::TextureUsage::Sampled,
+    });
+    device.uploadTextureData(envTex, env.pixels.data(), env.pixels.size() * sizeof(float));
 
     auto sampler = device.createSampler({});
+
+    // descriptor: env-текстура
+    Sky::RHI::DescriptorSetLayoutDesc skyLayoutDesc{};
+    skyLayoutDesc.bindings = { { 0, Sky::RHI::DescriptorType::CombinedImageSampler, Sky::RHI::ShaderStage::Fragment } };
+    auto skyLayout  = device.createDescriptorSetLayout(skyLayoutDesc);
+    auto skyDescSet = device.createDescriptorSet(skyLayout);
+    device.updateDescriptorSetTexture(skyDescSet, 0, envTex, sampler);   // переиспользуем sampler
+
+    // shaders
+    auto skyVertCode = loadSpirv(std::string(SHADER_DIR) + "/skybox.vert.spv");
+    auto skyFragCode = loadSpirv(std::string(SHADER_DIR) + "/skybox.frag.spv");
+    auto skyVs = device.createShader({ skyVertCode.data(), skyVertCode.size() * sizeof(uint32_t) });
+    auto skyFs = device.createShader({ skyFragCode.data(), skyFragCode.size() * sizeof(uint32_t) });
 
     Sky::RHI::DescriptorSetLayoutDesc layoutDesc{};
     layoutDesc.bindings = {
@@ -166,13 +194,23 @@ int main()
     pipeDesc.depthFormat         = Sky::RHI::Format::D32_SFLOAT;
     pipeDesc.pushConstantSize    = sizeof(PushConstants);
     pipeDesc.descriptorSetLayout = descLayout;
-
     const auto pipeline = device.createGraphicsPipeline(pipeDesc);
+
+    Sky::RHI::GraphicsPipelineDesc skyDesc{};
+    skyDesc.vertexShader        = skyVs;
+    skyDesc.fragmentShader      = skyFs;
+    skyDesc.vertexStride        = 0;
+    skyDesc.colorFormat         = device.swapchainFormat(sw);
+    skyDesc.depthFormat         = Sky::RHI::Format::D32_SFLOAT;   // match the pass's depth attachment
+    skyDesc.pushConstantSize    = sizeof(SkyPush);
+    skyDesc.descriptorSetLayout = skyLayout;
+    skyDesc.depthTest           = false;
+    skyDesc.depthWrite          = false;
+    auto skyPipeline = device.createGraphicsPipeline(skyDesc);
 
     // --- ImGui init (Vulkan backend via dynamic rendering; GLFW input backend) ---
     VkDescriptorPool imguiPool = VK_NULL_HANDLE;
     ImGui_ImplVulkan_InitInfo imguiInfo{};
-
     InitImGui(window, device, &imguiPool, &imguiInfo);
 
     // debug-tweakable scene params (demonstrates ImGui + useful for Phase 7 tuning)
@@ -229,12 +267,19 @@ int main()
       glm::mat4 proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 10.0f);
       proj[1][1] *= -1.0f;
 
+      glm::mat4 invViewProj = glm::inverse(proj * view);
+
       glm::mat4 mvp = proj * view * model;
 
       PushConstants pushConstants = {
         .mvp = mvp,
         .model = model,
       };
+
+      SkyPush skyPush{
+        invViewProj,
+        glm::vec4(0.0f, 0.0f, 3.0f, 0.0f)
+      };  // camPos = eye (0,0,3)
 
       SceneData scene{};
       scene.sunDir     = glm::normalize(glm::vec3(0.5f, 1.0f, 0.3f));
@@ -252,13 +297,22 @@ int main()
             { Sky::RHI::Format::D32_SFLOAT, extent.width, extent.height}));
         },
         [&](const TriData&, Sky::RHI::FGResources&, Sky::RHI::CommandList& cmd) {
+          // dynamic viewport/scissor must be set before ANY draw in the pass
+          cmd.setViewport(0.0f, 0.0f, static_cast<float>(extent.width), static_cast<float>(extent.height));
+          cmd.setScissor(0, 0, extent.width, extent.height);
+
+          // skybox (background, no depth)
+          cmd.bindPipeline(skyPipeline);
+          cmd.bindDescriptorSet(skyDescSet);
+          cmd.pushConstants(&skyPush, sizeof(SkyPush));
+          cmd.draw(3);
+
+          // model on top
           cmd.bindPipeline(pipeline);
           cmd.bindDescriptorSet(descSet);
           cmd.pushConstants(&pushConstants, sizeof(PushConstants));
           cmd.bindVertexBuffer(vb);
           cmd.bindIndexBuffer(ib, Sky::RHI::IndexType::UInt32);
-          cmd.setViewport(0.0f, 0.0f, static_cast<float>(extent.width), static_cast<float>(extent.height));
-          cmd.setScissor(0, 0, extent.width, extent.height);
           cmd.drawIndexed(indexCount);
         });
 

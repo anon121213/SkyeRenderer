@@ -242,3 +242,17 @@ GltfModel loadGltf(const std::string& path)
 
   return out;
 }
+
+HdrImage loadHdr(const std::string& path)
+{
+  int w, h, comp;
+  float* data = stbi_loadf(path.c_str(), &w, &h, &comp, 4);   // форсим RGBA (4 канала)
+  if (!data) throw std::runtime_error("Failed to load HDR: " + path);
+
+  HdrImage out;
+  out.width  = static_cast<uint32_t>(w);
+  out.height = static_cast<uint32_t>(h);
+  out.pixels.assign(data, data + static_cast<size_t>(w) * h * 4);
+  stbi_image_free(data);
+  return out;
+}

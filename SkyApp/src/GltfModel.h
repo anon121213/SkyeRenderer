@@ -33,6 +33,14 @@ struct GltfModel
   ImageData normal;       // normalTexture          — linear tangent-space normals
 };
 
+struct HdrImage
+{
+  std::vector<float> pixels;
+  uint32_t width = 0;
+  uint32_t height = 0;
+};
+
 // Loads the first mesh + its material maps from a .glb/.gltf file.
 // Throws std::runtime_error on failure.
 GltfModel loadGltf(const std::string& path);
+HdrImage loadHdr(const std::string& path);

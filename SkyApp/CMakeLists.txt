@@ -72,6 +72,8 @@ file(MAKE_DIRECTORY ${SHADER_BIN_DIR})
 set(SHADERS
         ${SHADER_SRC_DIR}/triangle.vert
         ${SHADER_SRC_DIR}/triangle.frag
+        ${SHADER_SRC_DIR}/skybox.vert
+        ${SHADER_SRC_DIR}/skybox.frag
 )
 
 set(SPIRV_BINARIES "")
